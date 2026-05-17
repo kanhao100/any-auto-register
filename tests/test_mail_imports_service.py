@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlmodel import SQLModel, create_engine
+from sqlmodel import SQLModel, Session, create_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -303,6 +303,74 @@ class MailImportServiceTests(unittest.TestCase):
                             ]
                         ),
                     )
+            finally:
+                test_engine.dispose()
+
+    def test_microsoft_snapshot_distinguishes_registered_accounts(self):
+        from core.db import AccountModel, OutlookAccountModel
+        from services.mail_imports.providers import MicrosoftMailImportStrategy
+        from services.mail_imports.schemas import MailImportSnapshotRequest
+
+        strategy = MicrosoftMailImportStrategy()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_engine = create_engine(f"sqlite:///{Path(tmp_dir) / 'mail-imports.db'}")
+            SQLModel.metadata.create_all(test_engine)
+
+            try:
+                with Session(test_engine) as session:
+                    session.add(
+                        OutlookAccountModel(
+                            email="registered@outlook.com",
+                            password="password-a",
+                            client_id="client-a",
+                            refresh_token="refresh-a",
+                            account_type="microsoft_oauth",
+                        )
+                    )
+                    session.add(
+                        OutlookAccountModel(
+                            email="new@hotmail.com",
+                            password="password-b",
+                            client_id="client-b",
+                            refresh_token="refresh-b",
+                            account_type="microsoft_oauth",
+                        )
+                    )
+                    session.add(
+                        OutlookAccountModel(
+                            email="mailapi@hotmail.com",
+                            password="",
+                            account_type="mailapi_url",
+                            mailapi_url="https://mailapi.icu/key?type=html&orderNo=abc123",
+                        )
+                    )
+                    session.add(
+                        AccountModel(
+                            platform="chatgpt",
+                            email="registered@outlook.com",
+                            password="chatgpt-password",
+                        )
+                    )
+                    session.commit()
+
+                with patch("services.mail_imports.providers.engine", test_engine):
+                    snapshot = strategy.get_snapshot(
+                        MailImportSnapshotRequest(type="microsoft", preview_limit=100)
+                    )
+
+                item_by_email = {item.email: item for item in snapshot.items}
+                self.assertTrue(item_by_email["registered@outlook.com"].is_registered)
+                self.assertFalse(item_by_email["new@hotmail.com"].is_registered)
+                self.assertFalse(item_by_email["mailapi@hotmail.com"].is_registered)
+                self.assertEqual(snapshot.registered_count, 1)
+                self.assertEqual(snapshot.unregistered_count, 2)
+                self.assertEqual(snapshot.selection_counts["microsoft"], 3)
+                self.assertEqual(snapshot.selection_counts["outlook"], 1)
+                self.assertEqual(snapshot.selection_counts["hotmail"], 1)
+                self.assertEqual(snapshot.selection_counts["mailapi"], 1)
+                self.assertEqual(snapshot.selection_registered_counts["outlook"], 1)
+                self.assertEqual(snapshot.selection_unregistered_counts["hotmail"], 1)
+                self.assertEqual(snapshot.selection_unregistered_counts["mailapi"], 1)
             finally:
                 test_engine.dispose()
 

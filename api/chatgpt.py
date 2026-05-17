@@ -193,9 +193,17 @@ def probe_promo_eligibility(
     codex_acc = _to_codex_account(account)
 
     from platforms.chatgpt.payment import probe_plus_promo_eligibility
+    from platforms.chatgpt.status_probe import probe_local_chatgpt_status
 
-    promo = probe_plus_promo_eligibility(codex_acc, proxy=req.proxy, country=req.country)
-    stored_probe = _persist_local_probe(account, {"promo": promo}, session, merge=True)
+    local_probe = probe_local_chatgpt_status(codex_acc, proxy=req.proxy)
+    promo = probe_plus_promo_eligibility(
+        codex_acc,
+        proxy=req.proxy,
+        country=req.country,
+        local_probe=local_probe,
+    )
+    local_probe["promo"] = promo
+    stored_probe = _persist_local_probe(account, local_probe, session, merge=False)
     return {
         "ok": promo.get("state") not in {"probe_failed", "unauthorized", "missing_access_token"},
         "email": account.email,

@@ -2,7 +2,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
-from typing import Optional
+from typing import Any, Callable, Optional
 from copy import deepcopy
 from datetime import datetime, timezone
 from core.db import TaskLog, TaskRunModel, engine
@@ -327,6 +327,104 @@ def enqueue_register_task(
         thread.start()
     else:
         background_tasks.add_task(_run_register, task_id, prepared)
+    return task_id
+
+
+def log_task_message(task_id: str, message: str) -> None:
+    _log(task_id, message)
+
+
+def update_task_counters(
+    task_id: str,
+    *,
+    success: int | None = None,
+    registered: int | None = None,
+) -> None:
+    _task_store.update_counters(
+        task_id,
+        success=success,
+        registered=registered,
+    )
+    _persist_task_snapshot(task_id)
+
+
+def enqueue_custom_task(
+    *,
+    platform: str,
+    source: str,
+    total: int = 1,
+    meta: dict[str, Any] | None = None,
+    runner: Callable[[str, Any], dict[str, Any] | None],
+) -> str:
+    task_id = f"task_{int(time.time() * 1000)}"
+    _task_store.create(
+        task_id,
+        platform=platform,
+        total=max(int(total or 1), 1),
+        source=source,
+        meta=meta,
+    )
+    _persist_task_snapshot(task_id)
+
+    def _run_custom() -> None:
+        control = _task_store.control_for(task_id)
+        _task_store.mark_running(task_id)
+        _persist_task_snapshot(task_id)
+
+        status = "done"
+        success = 0
+        registered = 0
+        skipped = 0
+        errors: list[str] = []
+        error = ""
+
+        try:
+            outcome = runner(task_id, control) or {}
+            status = str(outcome.get("status") or "done")
+            success = int(outcome.get("success") or (1 if status == "done" else 0))
+            registered = int(
+                outcome.get(
+                    "registered",
+                    success + int(outcome.get("skipped") or 0) + len(outcome.get("errors") or []),
+                )
+                or 0
+            )
+            skipped = int(outcome.get("skipped") or 0)
+            errors = [
+                str(item or "").strip()
+                for item in (outcome.get("errors") or [])
+                if str(item or "").strip()
+            ]
+            error = str(outcome.get("error") or "").strip()
+            if status == "failed" and not error:
+                error = errors[0] if errors else "任务失败"
+        except StopTaskRequested as exc:
+            status = "stopped"
+            error = str(exc)
+            errors = [error]
+            registered = 1
+            _log(task_id, f"[STOP] {exc}")
+        except Exception as exc:
+            status = "failed"
+            error = str(exc)
+            errors = [error]
+            registered = 1
+            _log(task_id, f"[FAIL] {exc}")
+        finally:
+            _task_store.set_progress(task_id, f"{max(int(total or 1), 1)}/{max(int(total or 1), 1)}")
+            _task_store.finish(
+                task_id,
+                status=status,
+                success=success,
+                registered=registered,
+                skipped=skipped,
+                errors=errors,
+                error=error,
+            )
+            _persist_task_snapshot(task_id)
+            _task_store.cleanup()
+
+    threading.Thread(target=_run_custom, daemon=True).start()
     return task_id
 
 

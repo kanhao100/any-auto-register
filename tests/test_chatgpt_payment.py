@@ -76,6 +76,50 @@ class ChatGPTPromoProbeTests(unittest.TestCase):
         self.assertEqual(result["state"], "ineligible")
         self.assertFalse(result["eligible"])
 
+    def test_probe_uses_local_probe_to_skip_paid_plan(self):
+        account = DummyAccount(access_token="access-token")
+
+        with mock.patch("platforms.chatgpt.payment._fetch_me_context") as me_mock, mock.patch(
+            "platforms.chatgpt.payment._request_checkout"
+        ) as checkout_mock:
+            result = probe_plus_promo_eligibility(
+                account,
+                local_probe={
+                    "auth": {"state": "access_token_valid", "http_status": 200},
+                    "subscription": {"plan": "plus", "workspace_plan_type": "individual"},
+                },
+            )
+
+        self.assertEqual(result["state"], "already_subscribed")
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["subscription_plan"], "plus")
+        me_mock.assert_not_called()
+        checkout_mock.assert_not_called()
+
+    def test_probe_uses_local_probe_to_short_circuit_unauthorized(self):
+        account = DummyAccount(access_token="access-token")
+
+        with mock.patch("platforms.chatgpt.payment._fetch_me_context") as me_mock, mock.patch(
+            "platforms.chatgpt.payment._request_checkout"
+        ) as checkout_mock:
+            result = probe_plus_promo_eligibility(
+                account,
+                local_probe={
+                    "auth": {
+                        "state": "access_token_invalidated",
+                        "http_status": 401,
+                        "message": "token invalidated",
+                    },
+                    "subscription": {"plan": "unknown"},
+                },
+            )
+
+        self.assertEqual(result["state"], "unauthorized")
+        self.assertFalse(result["eligible"])
+        self.assertIn("token invalidated", result["message"])
+        me_mock.assert_not_called()
+        checkout_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

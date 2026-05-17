@@ -4,14 +4,16 @@ from sqlmodel import Session, select
 from pydantic import BaseModel
 import json
 from typing import Any
-from core.db import AccountModel, get_session
+from core.db import AccountModel, engine, get_session
 from core.registry import get
 from core.base_platform import RegisterConfig
 from core.config_store import config_store
 from services.chatgpt_account_state import apply_chatgpt_status_policy
 from services.chatgpt_sync import update_account_model_cliproxy_sync
+from api.tasks import enqueue_custom_task, log_task_message
 
 router = APIRouter(prefix="/actions", tags=["actions"])
+TASK_ENABLED_ACTION_IDS = {"relogin", "reauthorize_rt"}
 
 
 class ActionRequest(BaseModel):
@@ -71,11 +73,11 @@ def _apply_action_result(
             status_reason = apply_chatgpt_status_policy(acc_model, local_probe=data.get("probe"))
         elif action_id == "probe_promo_eligibility":
             status_reason = apply_chatgpt_status_policy(acc_model, local_probe=data.get("probe"))
-        elif action_id == "relogin":
+        elif action_id in {"relogin", "reauthorize_rt"}:
             status_reason = apply_chatgpt_status_policy(acc_model, local_probe=data.get("probe"))
         elif action_id == "sync_cliproxyapi_status":
             status_reason = apply_chatgpt_status_policy(acc_model, remote_sync=data.get("sync"))
-        if status_reason or action_id == "relogin":
+        if status_reason or action_id in {"relogin", "reauthorize_rt"}:
             from datetime import datetime, timezone
 
             acc_model.updated_at = datetime.now(timezone.utc)
@@ -209,6 +211,13 @@ def _result_message(result: dict[str, Any]) -> str:
     if str(data or "").strip():
         return str(data)
     return str(result.get("error") or "").strip()
+
+
+def _resolve_action_definition(actions: list[dict[str, Any]], action_id: str) -> dict[str, Any]:
+    for action in actions:
+        if str(action.get("id") or "") == action_id:
+            return action
+    return {}
 
 
 def _execute_batch_cliproxy_sync(accounts: list[AccountModel], session: Session) -> dict[str, Any]:
@@ -383,3 +392,99 @@ def execute_action(
         raise HTTPException(400, str(e))
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@router.post("/{platform}/{account_id}/{action_id}/task")
+def execute_action_as_task(
+    platform: str,
+    account_id: int,
+    action_id: str,
+    body: ActionRequest,
+    session: Session = Depends(get_session),
+):
+    acc_model = session.get(AccountModel, account_id)
+    if not acc_model or acc_model.platform != platform:
+        raise HTTPException(404, "账号不存在")
+    if action_id not in TASK_ENABLED_ACTION_IDS:
+        raise HTTPException(400, "当前操作不支持任务日志模式")
+
+    PlatformCls = _get_platform_cls_or_404(platform)
+    action_instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
+    action_def = _resolve_action_definition(action_instance.get_platform_actions(), action_id)
+    action_label = str(action_def.get("label") or action_id).strip() or action_id
+    task_title = f"{action_label} · {acc_model.email}"
+
+    def _runner(task_id: str, control: Any) -> dict[str, Any]:
+        with Session(engine) as task_session:
+            task_acc_model = task_session.get(AccountModel, account_id)
+            if not task_acc_model or task_acc_model.platform != platform:
+                raise RuntimeError("账号不存在")
+
+            task_instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
+            task_instance._log_fn = lambda message: log_task_message(task_id, str(message or ""))
+            task_instance.bind_task_control(control)
+
+            log_task_message(task_id, f"开始执行 {action_label}: {task_acc_model.email}")
+            result = _execute_platform_action(
+                task_instance,
+                platform,
+                task_acc_model,
+                action_id,
+                body.params,
+                task_session,
+            )
+            task_session.commit()
+
+            ok = bool(result.get("ok"))
+            summary = _result_message(result) or (f"{action_label}完成" if ok else f"{action_label}失败")
+            if ok:
+                log_task_message(task_id, f"[OK] {summary}")
+                return {
+                    "status": "done",
+                    "success": 1,
+                    "registered": 1,
+                }
+
+            log_task_message(task_id, f"[FAIL] {summary}")
+            return {
+                "status": "failed",
+                "success": 0,
+                "registered": 1,
+                "errors": [summary],
+                "error": summary,
+            }
+
+    task_id = enqueue_custom_task(
+        platform=platform,
+        source="action",
+        total=1,
+        meta={
+            "task_kind": "account_action",
+            "title": task_title,
+            "action_id": action_id,
+            "action_label": action_label,
+            "account_id": account_id,
+            "account_email": acc_model.email,
+            "supports_skip_current": False,
+            "supports_stop": False,
+            "summary_labels": {
+                "success": "成功",
+                "registered": "已处理",
+                "total": "总数",
+            },
+            "status_texts": {
+                "done": "操作完成",
+                "failed": "操作失败",
+                "stopped": "操作已停止",
+            },
+        },
+        runner=_runner,
+    )
+    return {
+        "task_id": task_id,
+        "title": task_title,
+        "action_id": action_id,
+        "label": action_label,
+        "account_id": account_id,
+        "email": acc_model.email,
+    }

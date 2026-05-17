@@ -276,6 +276,7 @@ def probe_plus_promo_eligibility(
     account: Any,
     proxy: Optional[str] = None,
     country: str = "ID",
+    local_probe: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     country = str(country or "ID").strip().upper()
     currency = _COUNTRY_CURRENCY_MAP.get(country, "USD")
@@ -307,51 +308,117 @@ def probe_plus_promo_eligibility(
         )
         return result
 
-    me_status, me_data, me_body_text = _fetch_me_context(account, proxy=proxy)
-    me_message = _extract_response_message(me_data, me_body_text)
-    result["http_status"] = me_status
+    auth = local_probe.get("auth") if isinstance(local_probe, dict) and isinstance(local_probe.get("auth"), dict) else {}
+    subscription = local_probe.get("subscription") if isinstance(local_probe, dict) and isinstance(local_probe.get("subscription"), dict) else {}
+    auth_state = str(auth.get("state") or "").strip().lower()
+    auth_status = int(auth.get("http_status") or 0)
+    auth_message = str(auth.get("message") or "").strip()
+    local_plan = _normalize_plan_type(
+        str(subscription.get("plan") or "").strip(),
+        str(subscription.get("workspace_plan_type") or "").strip(),
+    )
+    local_workspace_plan_type = str(subscription.get("workspace_plan_type") or "").strip()
 
-    if me_status == 200:
-        workspace_plan_type = _extract_workspace_plan_type(me_data)
-        plan = _normalize_plan_type(str(me_data.get("plan_type") or "").strip(), workspace_plan_type)
-        result["subscription_plan"] = plan
-        result["workspace_plan_type"] = workspace_plan_type
-        if plan in {"plus", "team", "enterprise", "pro"}:
+    if isinstance(local_probe, dict):
+        result["http_status"] = auth_status
+        result["subscription_plan"] = local_plan
+        result["workspace_plan_type"] = local_workspace_plan_type
+
+        if auth_state == "missing_access_token":
+            result.update(
+                {
+                    "state": "missing_access_token",
+                    "eligible": False,
+                    "message": auth_message or "Local probe shows missing access_token",
+                }
+            )
+            return result
+
+        if auth_state in {"access_token_invalidated", "unauthorized"} or auth_status == 401:
+            result.update(
+                {
+                    "state": "unauthorized",
+                    "eligible": False,
+                    "message": auth_message or "Local probe shows access_token failed validation",
+                }
+            )
+            return result
+
+        if auth_state in {"account_deactivated", "banned_like"} or auth_status == 403:
+            result.update(
+                {
+                    "state": "probe_failed",
+                    "eligible": False,
+                    "message": auth_message or "Local probe shows account cannot access /backend-api/me",
+                }
+            )
+            return result
+
+        if local_plan in {"plus", "team", "enterprise", "pro"}:
             result.update(
                 {
                     "state": "already_subscribed",
                     "eligible": False,
-                    "message": f"Current account plan is {plan}; skip Plus promo check",
+                    "message": f"Current account plan is {local_plan}; skip Plus promo check",
                 }
             )
             return result
-    elif me_status == 401:
-        result.update(
-            {
-                "state": "unauthorized",
-                "eligible": False,
-                "message": me_message or "access_token failed /backend-api/me validation",
-            }
-        )
-        return result
-    elif me_status == 403:
-        result.update(
-            {
-                "state": "probe_failed",
-                "eligible": False,
-                "message": me_message or "Account cannot access /backend-api/me",
-            }
-        )
-        return result
-    elif me_status >= 400:
-        result.update(
-            {
-                "state": "probe_failed",
-                "eligible": False,
-                "message": me_message or f"/backend-api/me returned HTTP {me_status}",
-            }
-        )
-        return result
+
+        if auth_state and auth_state != "access_token_valid":
+            result.update(
+                {
+                    "state": "probe_failed",
+                    "eligible": False,
+                    "message": auth_message or f"Local probe returned auth state {auth_state}",
+                }
+            )
+            return result
+    else:
+        me_status, me_data, me_body_text = _fetch_me_context(account, proxy=proxy)
+        me_message = _extract_response_message(me_data, me_body_text)
+        result["http_status"] = me_status
+
+        if me_status == 200:
+            workspace_plan_type = _extract_workspace_plan_type(me_data)
+            plan = _normalize_plan_type(str(me_data.get("plan_type") or "").strip(), workspace_plan_type)
+            result["subscription_plan"] = plan
+            result["workspace_plan_type"] = workspace_plan_type
+            if plan in {"plus", "team", "enterprise", "pro"}:
+                result.update(
+                    {
+                        "state": "already_subscribed",
+                        "eligible": False,
+                        "message": f"Current account plan is {plan}; skip Plus promo check",
+                    }
+                )
+                return result
+        elif me_status == 401:
+            result.update(
+                {
+                    "state": "unauthorized",
+                    "eligible": False,
+                    "message": me_message or "access_token failed /backend-api/me validation",
+                }
+            )
+            return result
+        elif me_status == 403:
+            result.update(
+                {
+                    "state": "probe_failed",
+                    "eligible": False,
+                    "message": me_message or "Account cannot access /backend-api/me",
+                }
+            )
+            return result
+        elif me_status >= 400:
+            result.update(
+                {
+                    "state": "probe_failed",
+                    "eligible": False,
+                    "message": me_message or f"/backend-api/me returned HTTP {me_status}",
+                }
+            )
+            return result
 
     payload = {
         "plan_name": "chatgptplusplan",

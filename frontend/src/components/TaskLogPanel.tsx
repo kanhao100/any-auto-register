@@ -17,6 +17,21 @@ interface RegisterSummary {
   total: number
 }
 
+interface TaskPanelMeta {
+  supports_skip_current?: boolean
+  supports_stop?: boolean
+  summary_labels?: {
+    success?: string
+    registered?: string
+    total?: string
+  }
+  status_texts?: {
+    done?: string
+    failed?: string
+    stopped?: string
+  }
+}
+
 function parseCounter(value: unknown): number {
   const n = Number(value || 0)
   if (!Number.isFinite(n) || n < 0) return 0
@@ -43,6 +58,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const [summary, setSummary] = useState<RegisterSummary>({ success: 0, registered: 0, total: 0 })
   const [error, setError] = useState('')
   const [terminalStatus, setTerminalStatus] = useState<TaskTerminalStatus>('idle')
+  const [taskMeta, setTaskMeta] = useState<TaskPanelMeta>({})
   const [skipLoading, setSkipLoading] = useState(false)
   const [stopLoading, setStopLoading] = useState(false)
   const [stopRequested, setStopRequested] = useState(false)
@@ -51,6 +67,13 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const nextSinceRef = useRef(0)
 
   const isFinished = terminalStatus !== 'idle' || stopRequested
+  const summaryLabels = {
+    success: taskMeta.summary_labels?.success || '注册成功',
+    registered: taskMeta.summary_labels?.registered || '已注册',
+    total: taskMeta.summary_labels?.total || '总共注册',
+  }
+  const supportsSkipCurrent = taskMeta.supports_skip_current !== false
+  const supportsStop = taskMeta.supports_stop !== false
 
   const handleCopyAll = async () => {
     try {
@@ -112,6 +135,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     setSummary({ success: 0, registered: 0, total: 0 })
     setError('')
     setTerminalStatus('idle')
+    setTaskMeta({})
     setStopRequested(false)
 
     const sleep = async (ms: number) =>
@@ -125,6 +149,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
           success?: number
           registered?: number
           total?: number
+          meta?: TaskPanelMeta
           control?: { stop_requested?: boolean }
         }
         if (cancelled) return true
@@ -140,6 +165,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         )
         nextSinceRef.current = snapshotLines.length
         setStopRequested(Boolean(snapshot.control?.stop_requested))
+        setTaskMeta(snapshot.meta || {})
 
         if (snapshot.status === 'done' || snapshot.status === 'failed' || snapshot.status === 'stopped') {
           setTerminalStatus(snapshot.status)
@@ -264,42 +290,46 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
 
   const footerText =
     terminalStatus === 'done'
-      ? { text: '注册完成', color: '#10b981' }
+      ? { text: taskMeta.status_texts?.done || '注册完成', color: '#10b981' }
       : terminalStatus === 'stopped'
-        ? { text: '任务已停止', color: '#d97706' }
+        ? { text: taskMeta.status_texts?.stopped || '任务已停止', color: '#d97706' }
         : terminalStatus === 'failed'
-          ? { text: '任务失败', color: '#dc2626' }
+          ? { text: taskMeta.status_texts?.failed || '任务失败', color: '#dc2626' }
           : null
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <Space wrap style={{ marginBottom: 8 }}>
-        <Tag color="green">注册成功：{summary.success}</Tag>
-        <Tag color="blue">已注册：{summary.registered}</Tag>
-        <Tag color="default">总共注册：{summary.total}</Tag>
+        <Tag color="green">{summaryLabels.success}：{summary.success}</Tag>
+        <Tag color="blue">{summaryLabels.registered}：{summary.registered}</Tag>
+        <Tag color="default">{summaryLabels.total}：{summary.total}</Tag>
       </Space>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
         <Space>
-          <Button
-            size="small"
-            icon={<FastForwardOutlined />}
-            onClick={handleSkipCurrent}
-            loading={skipLoading}
-            disabled={isFinished}
-          >
-            跳过当前账号
-          </Button>
-          <Button
-            size="small"
-            danger
-            icon={<StopOutlined />}
-            onClick={handleStopTask}
-            loading={stopLoading}
-            disabled={isFinished}
-          >
-            停止任务
-          </Button>
+          {supportsSkipCurrent ? (
+            <Button
+              size="small"
+              icon={<FastForwardOutlined />}
+              onClick={handleSkipCurrent}
+              loading={skipLoading}
+              disabled={isFinished}
+            >
+              跳过当前账号
+            </Button>
+          ) : null}
+          {supportsStop ? (
+            <Button
+              size="small"
+              danger
+              icon={<StopOutlined />}
+              onClick={handleStopTask}
+              loading={stopLoading}
+              disabled={isFinished}
+            >
+              停止任务
+            </Button>
+          ) : null}
         </Space>
         <Button size="small" icon={<CopyOutlined />} onClick={handleCopyAll} disabled={lines.length === 0}>
           复制日志

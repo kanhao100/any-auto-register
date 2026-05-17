@@ -115,6 +115,19 @@ class ChatGPTPluginTests(unittest.TestCase):
         actions = platform.get_platform_actions()
 
         self.assertTrue(any(action["id"] == "relogin" for action in actions))
+        relogin_action = next(action for action in actions if action["id"] == "relogin")
+        self.assertEqual(relogin_action.get("run_mode"), "task")
+
+    def test_platform_actions_include_reauthorize_rt(self):
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+        )
+
+        actions = platform.get_platform_actions()
+
+        self.assertTrue(any(action["id"] == "reauthorize_rt" for action in actions))
+        reauthorize_action = next(action for action in actions if action["id"] == "reauthorize_rt")
+        self.assertEqual(reauthorize_action.get("run_mode"), "task")
 
     def test_custom_provider_rejects_blank_email(self):
         platform = ChatGPTPlatform(
@@ -232,6 +245,13 @@ class ChatGPTPluginTests(unittest.TestCase):
         )
 
         with mock.patch(
+            "platforms.chatgpt.status_probe.probe_local_chatgpt_status",
+            return_value={
+                "auth": {"state": "access_token_valid", "http_status": 200},
+                "subscription": {"plan": "free", "workspace_plan_type": "individual"},
+                "codex": {"state": "usable"},
+            },
+        ) as local_probe_mock, mock.patch(
             "platforms.chatgpt.payment.probe_plus_promo_eligibility",
             return_value={
                 "state": "eligible",
@@ -247,7 +267,9 @@ class ChatGPTPluginTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["promo"]["state"], "eligible")
         self.assertEqual(result["data"]["probe"]["auth"]["state"], "access_token_valid")
+        self.assertEqual(result["data"]["probe"]["subscription"]["plan"], "free")
         self.assertEqual(result["account_extra_patch"]["chatgpt_local"]["promo"]["country"], "ID")
+        local_probe_mock.assert_called_once()
 
     def test_execute_action_relogin_returns_tokens_and_probe_patch(self):
         platform = ChatGPTPlatform(config=RegisterConfig(extra={"default_executor": "headed"}))
@@ -351,6 +373,53 @@ class ChatGPTPluginTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "boom")
         self.assertEqual(result["data"]["logs"], ["[relogin] step before failure"])
+
+    def test_execute_action_reauthorize_rt_returns_tokens_and_probe_patch(self):
+        platform = ChatGPTPlatform(config=RegisterConfig(extra={"default_executor": "headed"}))
+        account = Account(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="secret",
+            token="stale-access-token",
+            status=AccountStatus.INVALID,
+            extra={
+                "access_token": "stale-access-token",
+                "refresh_token": "stale-refresh-token",
+            },
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.reauthorize_chatgpt_tokens",
+            return_value={
+                "access_token": "fresh-access-token",
+                "refresh_token": "fresh-refresh-token",
+                "id_token": "fresh-id-token",
+                "session_token": "fresh-session-token",
+                "workspace_id": "ws_456",
+                "probe": {
+                    "auth": {"state": "access_token_valid", "http_status": 200},
+                    "subscription": {"plan": "plus"},
+                    "codex": {"state": "usable"},
+                },
+                "relogin_method": "password",
+                "mailbox": {"available": True},
+                "token_source": "reauthorize_rt",
+            },
+        ) as reauthorize_mock:
+            result = platform.execute_action("reauthorize_rt", account, {})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["access_token"], "fresh-access-token")
+        self.assertEqual(result["data"]["refresh_token"], "fresh-refresh-token")
+        self.assertEqual(
+            result["account_extra_patch"]["chatgpt_token_source"],
+            "reauthorize_rt",
+        )
+        self.assertEqual(
+            result["account_extra_patch"]["chatgpt_last_rt_reauthorization"]["method"],
+            "password",
+        )
+        reauthorize_mock.assert_called_once()
 
 
 if __name__ == "__main__":

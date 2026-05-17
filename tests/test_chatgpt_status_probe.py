@@ -121,6 +121,37 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         self.assertEqual(result["subscription"]["plan"], "plus")
         self.assertEqual(result["codex"]["state"], "quota_exhausted")
 
+    def test_probe_falls_back_to_codex_plan_when_me_plan_missing(self):
+        account = DummyAccount(token="access-token", user_id="acct-123")
+
+        with mock.patch(
+            "platforms.chatgpt.status_probe._probe_backend_me",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text='{"object":"user"}',
+                body_json={"object": "user"},
+                error_code="",
+                message="ok",
+            ),
+        ), mock.patch(
+            "platforms.chatgpt.status_probe._probe_codex_usage",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text='{"plan_type":"plus","rate_limit":{"allowed":true}}',
+                body_json={"plan_type": "plus", "rate_limit": {"allowed": True}},
+                error_code="",
+                message='{"plan_type":"plus","rate_limit":{"allowed":true}}',
+            ),
+        ):
+            result = probe_local_chatgpt_status(account)
+
+        self.assertEqual(result["auth"]["state"], "access_token_valid")
+        self.assertEqual(result["subscription"]["plan"], "plus")
+        self.assertEqual(result["codex"]["plan_type"], "plus")
+        self.assertEqual(result["codex"]["state"], "usable")
+
 
 if __name__ == "__main__":
     unittest.main()

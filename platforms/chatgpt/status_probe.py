@@ -180,6 +180,44 @@ def _normalize_plan_type(plan_type: str, workspace_plan_type: str) -> str:
     return plan_type.strip().lower() or workspace_plan_type.strip().lower() or "unknown"
 
 
+def _extract_workspace_plan_type(me_data: dict[str, Any]) -> str:
+    workspace_plan_type = ""
+    orgs = ((me_data.get("orgs") or {}).get("data") if isinstance(me_data.get("orgs"), dict) else []) or []
+    if isinstance(orgs, list):
+        for org in orgs:
+            if not isinstance(org, dict):
+                continue
+            settings = org.get("settings") or {}
+            if isinstance(settings, dict) and str(settings.get("workspace_plan_type") or "").strip():
+                workspace_plan_type = str(settings.get("workspace_plan_type") or "").strip()
+                break
+    return workspace_plan_type
+
+
+def _extract_codex_plan_type(body: dict[str, Any]) -> str:
+    if not isinstance(body, dict):
+        return ""
+
+    candidates: list[Any] = [
+        body.get("plan_type"),
+        body.get("planType"),
+    ]
+    data = body.get("data")
+    if isinstance(data, dict):
+        candidates.extend(
+            [
+                data.get("plan_type"),
+                data.get("planType"),
+            ]
+        )
+
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _probe_backend_me(access_token: str, proxy: Optional[str]) -> ProbeHTTPResult:
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -243,6 +281,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
             "error_code": "",
             "message": "",
             "chatgpt_account_id": account_id,
+            "plan_type": "",
         },
     }
 
@@ -273,16 +312,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
     if me_result.status_code == 200 and me_result.body_json:
         body = me_result.body_json
         plan_type = str(body.get("plan_type") or "").strip()
-        workspace_plan_type = ""
-        orgs = ((body.get("orgs") or {}).get("data") if isinstance(body.get("orgs"), dict) else []) or []
-        if isinstance(orgs, list):
-            for org in orgs:
-                if not isinstance(org, dict):
-                    continue
-                settings = org.get("settings") or {}
-                if isinstance(settings, dict) and str(settings.get("workspace_plan_type") or "").strip():
-                    workspace_plan_type = str(settings.get("workspace_plan_type") or "").strip()
-                    break
+        workspace_plan_type = _extract_workspace_plan_type(body)
 
         result["auth"]["state"] = "access_token_valid"
         result["subscription"].update(
@@ -314,6 +344,14 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
                 "message": codex_result.message,
             }
         )
+        codex_plan_type = _extract_codex_plan_type(codex_result.body_json)
+        if codex_plan_type:
+            result["codex"]["plan_type"] = codex_plan_type
+            if str(result["subscription"].get("plan") or "").strip().lower() in {"", "unknown"}:
+                result["subscription"]["plan"] = _normalize_plan_type(
+                    codex_plan_type,
+                    str(result["subscription"].get("workspace_plan_type") or "").strip(),
+                )
         if codex_result.status_code == 200:
             result["codex"]["state"] = "usable"
         elif codex_result.status_code == 401:

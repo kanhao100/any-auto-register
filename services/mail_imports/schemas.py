@@ -31,6 +31,7 @@ class MailImportSnapshotItem(BaseModel):
     enabled: bool | None = None
     has_oauth: bool | None = None
     account_type: MailImportAccountType | None = None
+    is_registered: bool | None = None
 
 
 class MailImportSnapshotRequest(BaseModel):
@@ -101,6 +102,11 @@ class MailImportSnapshot(BaseModel):
     filename: str = ""
     path: str = ""
     pool_dir: str = ""
+    registered_count: int | None = None
+    unregistered_count: int | None = None
+    selection_counts: dict[str, int] = Field(default_factory=dict)
+    selection_registered_counts: dict[str, int] = Field(default_factory=dict)
+    selection_unregistered_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class MailImportSummary(BaseModel):

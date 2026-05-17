@@ -7,6 +7,7 @@ import { apiFetch } from '@/lib/utils'
 type MailImportProviderType = 'applemail' | 'microsoft'
 type MailImportSelectionType = MailImportProviderType | 'outlook' | 'hotmail' | 'mailapi'
 type MailImportFormProviderType = MailImportProviderType | 'mail_import'
+type MailImportStatsKey = 'microsoft' | 'outlook' | 'hotmail' | 'mailapi'
 
 interface MailImportPanelProps {
   form: FormInstance
@@ -36,6 +37,7 @@ interface MailImportSnapshotItem {
   enabled?: boolean | null
   has_oauth?: boolean | null
   account_type?: 'microsoft_oauth' | 'mailapi_url' | null
+  is_registered?: boolean | null
 }
 
 interface MailImportSnapshot {
@@ -47,6 +49,11 @@ interface MailImportSnapshot {
   filename: string
   path: string
   pool_dir: string
+  registered_count?: number | null
+  unregistered_count?: number | null
+  selection_counts?: Partial<Record<MailImportStatsKey, number>>
+  selection_registered_counts?: Partial<Record<MailImportStatsKey, number>>
+  selection_unregistered_counts?: Partial<Record<MailImportStatsKey, number>>
 }
 
 interface MailImportSummary {
@@ -193,6 +200,24 @@ function filterSnapshotBySelection(
   }
 }
 
+function resolveSnapshotStats(
+  snapshot: MailImportSnapshot | null,
+  selectionType: MailImportSelectionType,
+) {
+  if (!snapshot || selectionType === 'applemail' || snapshot.type !== 'microsoft') {
+    return null
+  }
+
+  const key: MailImportStatsKey = selectionType === 'microsoft' ? 'microsoft' : selectionType
+  const total = snapshot.selection_counts?.[key] ?? snapshot.items.length
+  const registered = snapshot.selection_registered_counts?.[key]
+    ?? snapshot.items.filter((item) => Boolean(item.is_registered)).length
+  const unregistered = snapshot.selection_unregistered_counts?.[key]
+    ?? Math.max(total - registered, 0)
+
+  return { total, registered, unregistered }
+}
+
 function buildImportSuccessMessage(result: MailImportResult) {
   if (result.type === 'applemail') {
     const fileLabel = result.snapshot.filename ? `，已绑定 ${result.snapshot.filename}` : ''
@@ -252,6 +277,10 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   )
   const snapshot = useMemo(
     () => filterSnapshotBySelection(rawSnapshot, selectedType),
+    [rawSnapshot, selectedType],
+  )
+  const snapshotStats = useMemo(
+    () => resolveSnapshotStats(rawSnapshot, selectedType),
     [rawSnapshot, selectedType],
   )
   const tableData = useMemo(
@@ -545,6 +574,15 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     } else {
       baseColumns.push(
         {
+          title: '注册',
+          dataIndex: 'is_registered',
+          key: 'is_registered',
+          width: 100,
+          render: (value: boolean | null | undefined) => (
+            <Tag color={value ? 'green' : 'orange'}>{value ? '已注册' : '未注册'}</Tag>
+          ),
+        } as never,
+        {
           title: '类型',
           dataIndex: 'account_type',
           key: 'account_type',
@@ -718,7 +756,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
           <Tag color="blue">
             {selectedType === 'applemail'
               ? `已导入: ${snapshot?.count || 0} 个邮箱`
-              : `当前预览匹配: ${snapshot?.items.length || 0}${rawSnapshot?.truncated ? ` / 总池 ${rawSnapshot?.count || 0}` : ''}`}
+              : `当前类型匹配: ${snapshotStats?.total || 0} / 已注册 ${snapshotStats?.registered || 0} / 未注册 ${snapshotStats?.unregistered || 0}${rawSnapshot?.truncated ? ` / 总池 ${rawSnapshot?.count || 0}` : ''}`}
           </Tag>
           {selectedType === 'applemail' && snapshot?.filename ? (
             <Typography.Text type="secondary">当前文件: {snapshot.filename}</Typography.Text>

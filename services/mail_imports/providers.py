@@ -14,7 +14,7 @@ from core.applemail_pool import (
     save_applemail_pool_json,
 )
 from core.config_store import config_store
-from core.db import OutlookAccountModel, engine
+from core.db import AccountModel, OutlookAccountModel, engine
 
 from .base import BaseMailImportStrategy
 from .microsoft_import_rules import (
@@ -41,6 +41,35 @@ from .schemas import (
 
 def _utcnow():
     return datetime.now(timezone.utc)
+
+
+def _normalize_microsoft_account_type(account_type: str | None) -> str:
+    normalized = str(account_type or ACCOUNT_TYPE_MICROSOFT_OAUTH).strip().lower()
+    return normalized or ACCOUNT_TYPE_MICROSOFT_OAUTH
+
+
+def _resolve_microsoft_snapshot_keys(email: str, account_type: str | None) -> list[str]:
+    normalized_type = _normalize_microsoft_account_type(account_type)
+    keys = ["microsoft"]
+    if normalized_type == "mailapi_url":
+        keys.append("mailapi")
+        return keys
+
+    domain = str(email.split("@")[1] if "@" in email else "").strip().lower()
+    if "hotmail" in domain:
+        keys.append("hotmail")
+    elif "outlook" in domain:
+        keys.append("outlook")
+    return keys
+
+
+def _build_selection_counter_map() -> dict[str, int]:
+    return {
+        "microsoft": 0,
+        "outlook": 0,
+        "hotmail": 0,
+        "mailapi": 0,
+    }
 
 
 class AppleMailImportStrategy(BaseMailImportStrategy):
@@ -387,24 +416,49 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
             accounts = session.exec(
                 select(OutlookAccountModel).order_by(OutlookAccountModel.id)
             ).all()
+            registered_emails = {
+                str(email or "").strip().lower()
+                for email in session.exec(
+                    select(AccountModel.email).where(AccountModel.platform == "chatgpt")
+                ).all()
+                if str(email or "").strip()
+            }
 
         limit = max(int(request.preview_limit or 0), 0)
         preview = accounts[:limit] if limit else []
+        selection_counts = _build_selection_counter_map()
+        selection_registered_counts = _build_selection_counter_map()
+        selection_unregistered_counts = _build_selection_counter_map()
+
+        for account in accounts:
+            email = str(account.email or "").strip()
+            is_registered = email.lower() in registered_emails
+            for key in _resolve_microsoft_snapshot_keys(
+                email,
+                getattr(account, "account_type", ACCOUNT_TYPE_MICROSOFT_OAUTH),
+            ):
+                selection_counts[key] += 1
+                if is_registered:
+                    selection_registered_counts[key] += 1
+                else:
+                    selection_unregistered_counts[key] += 1
+
         items = [
             MailImportSnapshotItem(
                 index=idx,
                 email=account.email,
                 enabled=bool(account.enabled),
                 has_oauth=bool(
-                    str(getattr(account, "account_type", ACCOUNT_TYPE_MICROSOFT_OAUTH) or ACCOUNT_TYPE_MICROSOFT_OAUTH)
-                    == ACCOUNT_TYPE_MICROSOFT_OAUTH
+                    _normalize_microsoft_account_type(
+                        getattr(account, "account_type", ACCOUNT_TYPE_MICROSOFT_OAUTH)
+                    ) == ACCOUNT_TYPE_MICROSOFT_OAUTH
                     and account.client_id
                     and account.refresh_token
                 ),
-                account_type=str(
+                account_type=_normalize_microsoft_account_type(
                     getattr(account, "account_type", ACCOUNT_TYPE_MICROSOFT_OAUTH)
-                    or ACCOUNT_TYPE_MICROSOFT_OAUTH
                 ),
+                is_registered=str(account.email or "").strip().lower() in registered_emails,
             )
             for idx, account in enumerate(preview, start=1)
         ]
@@ -415,6 +469,11 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
             count=len(accounts),
             items=items,
             truncated=len(accounts) > limit if limit > 0 else len(accounts) > 0,
+            registered_count=selection_registered_counts["microsoft"],
+            unregistered_count=selection_unregistered_counts["microsoft"],
+            selection_counts=selection_counts,
+            selection_registered_counts=selection_registered_counts,
+            selection_unregistered_counts=selection_unregistered_counts,
         )
 
     def execute(self, request: MailImportExecuteRequest) -> MailImportResponse:

@@ -10,7 +10,11 @@ from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
 )
-from platforms.chatgpt.relogin import relogin_chatgpt_account, snapshot_mailbox_account
+from platforms.chatgpt.relogin import (
+    reauthorize_chatgpt_tokens,
+    relogin_chatgpt_account,
+    snapshot_mailbox_account,
+)
 
 
 def _merge_local_probe(existing: dict | None, **patch: dict) -> dict:
@@ -244,7 +248,8 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "probe_promo_eligibility", "label": "检测 Plus 优惠资格", "params": []},
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
-            {"id": "relogin", "label": "二次登录取 Token", "params": []},
+            {"id": "relogin", "label": "二次登录取 Token", "params": [], "run_mode": "task"},
+            {"id": "reauthorize_rt", "label": "重新授权 RT (AT+RT)", "params": [], "run_mode": "task"},
             {
                 "id": "payment_link",
                 "label": "生成 Plus GoPay 长链接",
@@ -316,6 +321,82 @@ class ChatGPTPlatform(BasePlatform):
         a.user_id = account.user_id
         a.extra = extra
 
+        def _execute_oauth_repair_action(
+            *,
+            runner,
+            success_label: str,
+            failure_label: str,
+            result_extra_key: str,
+            default_token_source: str,
+        ) -> dict:
+            outer_log_fn = getattr(self, "_log_fn", None)
+            action_logs: list[str] = []
+
+            def _capture_action_log(message: str) -> None:
+                text = str(message or "").strip()
+                if not text:
+                    return
+                action_logs.append(text)
+                if callable(outer_log_fn):
+                    outer_log_fn(text)
+
+            try:
+                action_result = runner(
+                    a,
+                    config=self.config.extra if self.config else {},
+                    proxy=proxy,
+                    browser_mode=(
+                        (self.config.executor_type if self.config else None)
+                        or ((self.config.extra or {}).get("default_executor") if self.config else None)
+                        or "protocol"
+                    ),
+                    log_fn=_capture_action_log,
+                )
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": str(exc),
+                    "data": {
+                        "message": f"{failure_label}: {exc}",
+                        "logs": action_logs,
+                    },
+                }
+
+            probe_result = (
+                action_result.get("probe")
+                if isinstance(action_result.get("probe"), dict)
+                else {}
+            )
+            summary = (
+                f"认证={probe_result.get('auth', {}).get('state', 'unknown')}, "
+                f"订阅={probe_result.get('subscription', {}).get('plan', 'unknown')}, "
+                f"Codex={probe_result.get('codex', {}).get('state', 'unknown')}"
+            )
+            return {
+                "ok": True,
+                "data": {
+                    "access_token": action_result.get("access_token", ""),
+                    "refresh_token": action_result.get("refresh_token", ""),
+                    "id_token": action_result.get("id_token", ""),
+                    "session_token": action_result.get("session_token", ""),
+                    "workspace_id": action_result.get("workspace_id", ""),
+                    "message": f"{success_label}：{summary}",
+                    "probe": probe_result,
+                    "logs": action_logs,
+                },
+                "account_extra_patch": {
+                    "chatgpt_local": probe_result,
+                    result_extra_key: {
+                        "method": action_result.get("relogin_method", ""),
+                        "mailbox": action_result.get("mailbox", {}),
+                    },
+                    "chatgpt_token_source": action_result.get(
+                        "token_source",
+                        default_token_source,
+                    ),
+                },
+            }
+
         if action_id == "probe_local_status":
             from platforms.chatgpt.status_probe import probe_local_chatgpt_status
 
@@ -337,15 +418,19 @@ class ChatGPTPlatform(BasePlatform):
             }
 
         if action_id == "probe_promo_eligibility":
+            from platforms.chatgpt.status_probe import probe_local_chatgpt_status
             from platforms.chatgpt.payment import probe_plus_promo_eligibility
 
+            fresh_probe = probe_local_chatgpt_status(a, proxy=proxy)
             promo_result = probe_plus_promo_eligibility(
                 a,
                 proxy=proxy,
                 country=str(params.get("country", "ID") or "ID").strip().upper(),
+                local_probe=fresh_probe,
             )
-            local_probe = _merge_local_probe(extra.get("chatgpt_local"), promo=promo_result)
+            local_probe = _merge_local_probe(fresh_probe, promo=promo_result)
             summary = (
+                f"认证={local_probe.get('auth', {}).get('state', 'unknown')}, "
                 f"优惠={promo_result.get('state', 'unknown')}, "
                 f"plan={promo_result.get('subscription_plan', 'unknown')}"
             )
@@ -405,69 +490,22 @@ class ChatGPTPlatform(BasePlatform):
             return {"ok": False, "error": result.error_message}
 
         if action_id == "relogin":
-            outer_log_fn = getattr(self, "_log_fn", None)
-            relogin_logs: list[str] = []
-
-            def _capture_relogin_log(message: str) -> None:
-                text = str(message or "").strip()
-                if not text:
-                    return
-                relogin_logs.append(text)
-                if callable(outer_log_fn):
-                    outer_log_fn(text)
-
-            try:
-                relogin_result = relogin_chatgpt_account(
-                    a,
-                    config=self.config.extra if self.config else {},
-                    proxy=proxy,
-                    browser_mode=(
-                        (self.config.executor_type if self.config else None)
-                        or ((self.config.extra or {}).get("default_executor") if self.config else None)
-                        or "protocol"
-                    ),
-                    log_fn=_capture_relogin_log,
-                )
-            except Exception as exc:
-                return {
-                    "ok": False,
-                    "error": str(exc),
-                    "data": {
-                        "message": f"二次登录失败: {exc}",
-                        "logs": relogin_logs,
-                    },
-                }
-            probe_result = (
-                relogin_result.get("probe")
-                if isinstance(relogin_result.get("probe"), dict)
-                else {}
+            return _execute_oauth_repair_action(
+                runner=relogin_chatgpt_account,
+                success_label="二次登录完成",
+                failure_label="二次登录失败",
+                result_extra_key="chatgpt_last_relogin",
+                default_token_source="relogin",
             )
-            summary = (
-                f"认证={probe_result.get('auth', {}).get('state', 'unknown')}, "
-                f"订阅={probe_result.get('subscription', {}).get('plan', 'unknown')}, "
-                f"Codex={probe_result.get('codex', {}).get('state', 'unknown')}"
+
+        if action_id == "reauthorize_rt":
+            return _execute_oauth_repair_action(
+                runner=reauthorize_chatgpt_tokens,
+                success_label="重新授权 RT 完成",
+                failure_label="重新授权 RT 失败",
+                result_extra_key="chatgpt_last_rt_reauthorization",
+                default_token_source="reauthorize_rt",
             )
-            return {
-                "ok": True,
-                "data": {
-                    "access_token": relogin_result.get("access_token", ""),
-                    "refresh_token": relogin_result.get("refresh_token", ""),
-                    "id_token": relogin_result.get("id_token", ""),
-                    "session_token": relogin_result.get("session_token", ""),
-                    "workspace_id": relogin_result.get("workspace_id", ""),
-                    "message": f"二次登录完成：{summary}",
-                    "probe": probe_result,
-                    "logs": relogin_logs,
-                },
-                "account_extra_patch": {
-                    "chatgpt_local": probe_result,
-                    "chatgpt_last_relogin": {
-                        "method": relogin_result.get("relogin_method", ""),
-                        "mailbox": relogin_result.get("mailbox", {}),
-                    },
-                    "chatgpt_token_source": "relogin",
-                },
-            }
 
         if action_id == "payment_link":
             from platforms.chatgpt.payment import generate_plus_link, generate_team_link

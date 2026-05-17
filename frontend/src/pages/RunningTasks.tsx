@@ -29,6 +29,11 @@ interface TaskSnapshot {
   id: string
   platform: string
   source: string
+  meta?: {
+    title?: string
+    action_label?: string
+    account_email?: string
+  }
   status: 'pending' | 'running' | 'done' | 'failed' | 'stopped'
   total: number
   progress: string
@@ -54,6 +59,7 @@ const SOURCE_LABELS: Record<string, string> = {
   manual: '手动',
   api: 'API',
   schedule: '调度',
+  action: '账号操作',
 }
 
 const STATUS_CONFIG: Record<string, { color: string; label: string; icon?: React.ReactNode }> = {
@@ -187,6 +193,11 @@ export default function RunningTasks() {
                   {SOURCE_LABELS[task.source] || task.source || '-'}
                 </Text>
               </Space>
+              {task.meta?.title ? (
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  {task.meta.title}
+                </Text>
+              ) : null}
             </Space>
           </Col>
 

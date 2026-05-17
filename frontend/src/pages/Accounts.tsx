@@ -16,6 +16,7 @@ import {
   Typography,
   Alert,
   DatePicker,
+  Empty,
   theme,
 } from 'antd'
 import type { MenuProps } from 'antd'
@@ -29,13 +30,14 @@ import {
   MoreOutlined,
   DeleteOutlined,
   SyncOutlined,
+  MailOutlined,
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
-import { apiFetch } from '@/lib/utils'
+import { apiFetch, getToken } from '@/lib/utils'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 
 const { Text } = Typography
@@ -182,7 +184,34 @@ function formatStructuredText(value?: string) {
   return trimmed
 }
 
-type BatchActionKind = 'probe' | 'promo' | 'remote' | 'refresh' | 'relogin'
+type BatchActionKind = 'probe' | 'promo' | 'remote' | 'refresh' | 'relogin' | 'reauthorize_rt'
+type ExportFormat = 'csv' | 'json' | 'txt' | 'cpa' | 'sub2api'
+
+interface AccountMailboxFolder {
+  key: string
+  label: string
+}
+
+interface AccountMailboxMessage {
+  id: string
+  folder: string
+  subject: string
+  sender: string
+  sender_address: string
+  received_at: string
+  preview: string
+  body: string
+}
+
+interface AccountMailboxResponse {
+  provider: string
+  backend: string
+  email: string
+  active_folder: string
+  folders: AccountMailboxFolder[]
+  messages: AccountMailboxMessage[]
+  limit: number
+}
 
 function getBatchActionLabel(kind: BatchActionKind) {
   switch (kind) {
@@ -196,14 +225,37 @@ function getBatchActionLabel(kind: BatchActionKind) {
       return 'Token 刷新'
     case 'relogin':
       return '二次登录'
+    case 'reauthorize_rt':
+      return '重新授权 RT'
     default:
       return kind
   }
 }
 
+function getExportFormatLabel(format: ExportFormat) {
+  switch (format) {
+    case 'csv':
+      return 'CSV'
+    case 'json':
+      return 'JSON'
+    case 'txt':
+      return 'TXT'
+    case 'cpa':
+      return 'CPA ZIP'
+    case 'sub2api':
+      return 'Sub2API JSON'
+    default:
+      return ''
+  }
+}
+
+function canRunChatgptRelogin(account: any) {
+  return Boolean(String(account?.password || '').trim())
+}
+
 function shouldOfferChatgptRelogin(account: any) {
   const authState = String(account?.chatgptLocal?.auth?.state || '').trim()
-  return Boolean(account?.password) && ['access_token_invalidated', 'unauthorized', 'missing_access_token'].includes(authState)
+  return canRunChatgptRelogin(account) && ['access_token_invalidated', 'unauthorized', 'missing_access_token'].includes(authState)
 }
 
 function appendActionLogsToText(text: string, logs: unknown) {
@@ -217,6 +269,44 @@ function appendActionLogsToText(text: string, logs: unknown) {
   const baseText = String(text || '').trim()
   const suffix = `执行日志\n${normalizedLogs.join('\n')}`
   return baseText ? `${baseText}\n\n${suffix}` : suffix
+}
+
+function getMailboxSnapshot(account: any) {
+  const extra = account?.extra && typeof account.extra === 'object' ? account.extra : {}
+  const snapshot = extra.mailbox_account
+  return snapshot && typeof snapshot === 'object' ? snapshot : null
+}
+
+function resolveAccountMailboxProvider(account: any) {
+  const extra = account?.extra && typeof account.extra === 'object' ? account.extra : {}
+  const snapshot = getMailboxSnapshot(account)
+  const snapshotExtra = snapshot?.extra && typeof snapshot.extra === 'object' ? snapshot.extra : {}
+
+  let provider = String(extra.mail_provider || snapshotExtra.provider || '').trim().toLowerCase()
+  if (provider === 'outlook') return 'microsoft'
+  if (provider === 'mail_import') {
+    const source = String(extra.mail_import_source || snapshotExtra.provider || '').trim().toLowerCase()
+    return source === 'applemail' ? 'applemail' : 'microsoft'
+  }
+  return provider
+}
+
+function supportsMailboxViewer(account: any) {
+  const provider = resolveAccountMailboxProvider(account)
+  return provider === 'microsoft' && Boolean(getMailboxSnapshot(account)?.email || account?.email)
+}
+
+function mailboxBackendLabel(value?: string) {
+  switch ((value || '').toLowerCase()) {
+    case 'graph':
+      return 'Graph'
+    case 'imap':
+      return 'IMAP'
+    case 'mailapi_url':
+      return 'MailAPI URL'
+    default:
+      return value || '-'
+  }
 }
 
 function SummaryField({
@@ -302,18 +392,21 @@ function LocalProbeSummary({ probe }: { probe: any }) {
   const codex = probe?.codex || {}
   const promo = probe?.promo || {}
   const promoMeta = promoStateMeta(promo.state, promo.offer_title || 'Plus 优惠')
+  const planInfo = planMeta(subscription.plan)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
         <Tag color={authStateMeta(auth.state).color}>认证: {authStateMeta(auth.state).label}</Tag>
-        <Tag color={planMeta(subscription.plan).color}>订阅: {planMeta(subscription.plan).label}</Tag>
+        <Tag color={planInfo.color}>订阅: {planInfo.label}</Tag>
         <Tag color={codexStateMeta(codex.state).color}>Codex: {codexStateMeta(codex.state).label}</Tag>
         <Tag color={promoMeta.color}>{promoMeta.label}</Tag>
       </div>
       <SummaryField label="探测时间" value={checkedAt ? formatSyncTime(checkedAt) : ''} />
       <SummaryField label="认证信息" value={auth.message} code />
+      <SummaryField label="套餐类型" value={planInfo.label} />
       <SummaryField label="工作区套餐" value={subscription.workspace_plan_type} />
+      <SummaryField label="Codex 套餐" value={codex.plan_type} />
       <SummaryField label="Codex 信息" value={codex.message} code />
       <SummaryField label="优惠地区" value={promo.country} />
       <SummaryField label="优惠类型" value={promo.offer_title || promo.offer_kind} />
@@ -426,7 +519,17 @@ function CliproxySyncSummary({ sync }: { sync: any }) {
   )
 }
 
-function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => void; actions: any[] }) {
+function ActionMenu({
+  acc,
+  onRefresh,
+  actions,
+  onOpenTaskLog,
+}: {
+  acc: any
+  onRefresh: () => void
+  actions: any[]
+  onOpenTaskLog?: (taskId: string, title: string, accountId: number) => void
+}) {
   const [resultOpen, setResultOpen] = useState(false)
   const [resultTitle, setResultTitle] = useState('')
   const [resultStatus, setResultStatus] = useState<'success' | 'error'>('success')
@@ -458,12 +561,28 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
 
   const handleAction = async (actionId: string) => {
     if (runningActionId) return
-    const actionLabel = actions.find((item) => item.id === actionId)?.label || actionId
+    const action = actions.find((item) => item.id === actionId) || {}
+    const actionLabel = action?.label || actionId
     const toastKey = `account-action:${acc?.id}:${actionId}`
     setRunningActionId(actionId)
     message.loading({ content: `${actionLabel}运行中...`, key: toastKey, duration: 0 })
 
     try {
+      if (action?.run_mode === 'task') {
+        const taskResult = await apiFetch(`/actions/${acc.platform}/${acc.id}/${actionId}/task`, {
+          method: 'POST',
+          body: JSON.stringify({ params: {} }),
+        })
+        const taskId = String(taskResult?.task_id || '').trim()
+        if (!taskId) {
+          throw new Error('未返回任务 ID')
+        }
+        const taskTitle = String(taskResult?.title || `${actionLabel} · ${acc?.email || ''}`).trim()
+        message.success({ content: `${actionLabel}已启动，可实时查看日志`, key: toastKey })
+        onOpenTaskLog?.(taskId, taskTitle, Number(acc?.id || 0))
+        return
+      }
+
       const r = await apiFetch(`/actions/${acc.platform}/${acc.id}/${actionId}`, {
         method: 'POST',
         body: JSON.stringify({ params: {} }),
@@ -632,7 +751,18 @@ export default function Accounts() {
   const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
   const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [batchActionLoading, setBatchActionLoading] = useState('')
-  const [detailActionLoading, setDetailActionLoading] = useState<'relogin' | ''>('')
+  const [detailActionLoading, setDetailActionLoading] = useState<'relogin' | 'reauthorize_rt' | ''>('')
+  const [exportLoading, setExportLoading] = useState<ExportFormat | ''>('')
+  const [actionTaskModalOpen, setActionTaskModalOpen] = useState(false)
+  const [actionTaskId, setActionTaskId] = useState<string | null>(null)
+  const [actionTaskTitle, setActionTaskTitle] = useState('')
+  const [actionTaskAccountId, setActionTaskAccountId] = useState<number | null>(null)
+  const [mailboxModalOpen, setMailboxModalOpen] = useState(false)
+  const [mailboxViewerAccount, setMailboxViewerAccount] = useState<any>(null)
+  const [mailboxLoading, setMailboxLoading] = useState(false)
+  const [mailboxData, setMailboxData] = useState<AccountMailboxResponse | null>(null)
+  const [mailboxError, setMailboxError] = useState('')
+  const [selectedMailboxMessageId, setSelectedMailboxMessageId] = useState('')
 
   useEffect(() => {
     if (platform) setCurrentPlatform(platform)
@@ -645,6 +775,13 @@ export default function Accounts() {
       token: currentAccount.token,
     })
   }, [detailModalOpen, currentAccount, detailForm])
+
+  const openActionTaskLog = useCallback((taskId: string, title: string, accountId: number) => {
+    setActionTaskId(taskId)
+    setActionTaskTitle(title)
+    setActionTaskAccountId(Number.isInteger(accountId) && accountId > 0 ? accountId : null)
+    setActionTaskModalOpen(true)
+  }, [])
 
   const load = useCallback(async () => {
     if (createdAtStart && createdAtEnd && new Date(createdAtStart).getTime() > new Date(createdAtEnd).getTime()) {
@@ -671,6 +808,17 @@ export default function Accounts() {
     }
   }, [currentPlatform, search, filterStatus, createdAtStart, createdAtEnd, page, pageSize])
 
+  const handleActionTaskDone = useCallback(async () => {
+    const refreshedItems = await load()
+    if (!actionTaskAccountId) return
+    const refreshedAccount = Array.isArray(refreshedItems)
+      ? refreshedItems.find((item: any) => item.id === actionTaskAccountId) || null
+      : null
+    if (refreshedAccount && currentAccount?.id === actionTaskAccountId) {
+      setCurrentAccount(refreshedAccount)
+    }
+  }, [actionTaskAccountId, currentAccount?.id, load])
+
   useEffect(() => {
     load()
   }, [load])
@@ -695,73 +843,64 @@ export default function Accounts() {
     }
   }
 
-  const exportCsv = () => {
-    const quoteCsv = (value: any) => {
-      const text = value == null ? '' : String(value)
-      return `"${text.replace(/"/g, '""')}"`
-    }
+  const downloadExport = async (format: ExportFormat) => {
+    if (!currentPlatform) return
 
-    const downloadCsv = (content: string) => {
-      const blob = new Blob([`\uFEFF${content}`], { type: 'text/csv;charset=utf-8;' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${currentPlatform}_accounts.csv`
-      a.click()
-      URL.revokeObjectURL(url)
-    }
-
-    if (currentPlatform === 'kiro') {
-      const header = ['邮箱', '昵称', '登录方式', 'RefreshToken', 'ClientId', 'ClientSecret', 'Region']
-      const rows = accounts.map((a) => {
-        const nickname = a.extra?.name || String(a.email || '').split('@')[0] || ''
-        const provider = a.extra?.provider || 'BuilderId'
-        const refreshToken = a.extra?.refreshToken || ''
-        const clientId = a.extra?.clientId || ''
-        const clientSecret = a.extra?.clientSecret || ''
-        const region = a.extra?.region || 'us-east-1'
-
-        return [
-          a.email || '',
-          nickname,
-          provider,
-          refreshToken,
-          clientId,
-          clientSecret,
-          region,
-        ].map(quoteCsv).join(',')
-      })
-
-      downloadCsv([header.map(quoteCsv).join(','), ...rows].join('\r\n'))
-      return
-    }
-
-    const header = ['email', 'password', 'status', 'region', 'cashier_url', 'created_at']
-    if (currentPlatform === 'kiro') {
-      header.push('accessToken', 'refreshToken', 'clientId', 'clientSecret')
-    } else if (currentPlatform === 'chatgpt') {
-      header.push('token', 'refresh_token')
-    } else {
-      header.push('token')
-    }
-
-    const rows = accounts.map((a) => {
-      const baseRow = [a.email, a.password, a.status, a.region, a.cashier_url, a.created_at].map(quoteCsv)
-      if (currentPlatform === 'kiro') {
-        baseRow.push(quoteCsv(a.extra?.accessToken || a.extra?.webAccessToken || a.token))
-        baseRow.push(quoteCsv(a.extra?.refreshToken))
-        baseRow.push(quoteCsv(a.extra?.clientId))
-        baseRow.push(quoteCsv(a.extra?.clientSecret))
-      } else if (currentPlatform === 'chatgpt') {
-        baseRow.push(quoteCsv(a.token))
-        baseRow.push(quoteCsv(getRefreshToken(a)))
-      } else {
-        baseRow.push(quoteCsv(a.token))
-      }
-      return baseRow.join(',')
+    const token = getToken()
+    const selectedIds = Array.from(selectedRowKeys)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+    const exportingSelected = selectedIds.length > 0
+    const params = new URLSearchParams({
+      platform: currentPlatform,
+      format,
     })
+    if (exportingSelected) {
+      params.set('ids', selectedIds.join(','))
+    }
+    if (search) params.set('email', search)
+    if (filterStatus) params.set('status', filterStatus)
+    if (createdAtStart) params.set('created_at_start', createdAtStart)
+    if (createdAtEnd) params.set('created_at_end', createdAtEnd)
 
-    downloadCsv([header.map(quoteCsv).join(','), ...rows].join('\r\n'))
+    setExportLoading(format)
+    try {
+      const response = await fetch(`/api/accounts/export?${params.toString()}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!response.ok) {
+        const text = await response.text()
+        try {
+          const payload = JSON.parse(text)
+          throw new Error(payload.detail || text)
+        } catch (error) {
+          if (error instanceof SyntaxError) {
+            throw new Error(text || '导出失败')
+          }
+          throw error
+        }
+      }
+
+      const blob = await response.blob()
+      const disposition = response.headers.get('Content-Disposition') || ''
+      const matchedName = disposition.match(/filename="?([^"]+)"?/)
+      const fileName = matchedName?.[1] || `${currentPlatform}_accounts.${format}`
+
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = fileName
+      link.click()
+      URL.revokeObjectURL(url)
+      const exportLabel = getExportFormatLabel(format)
+      const scopeLabel = exportingSelected ? `所选 ${selectedIds.length} 个账号` : '当前筛选账号'
+      message.success(`已导出 ${scopeLabel}的 ${exportLabel} 文件`)
+    } catch (error: any) {
+      const detail = error?.message ? String(error.message) : '导出失败'
+      message.error(detail)
+    } finally {
+      setExportLoading('')
+    }
   }
 
   const handleDelete = async (id: number) => {
@@ -915,91 +1054,101 @@ export default function Accounts() {
     load()
   }
 
-  const handleDetailRelogin = async () => {
+  const handleCopyDetailAccessToken = async () => {
+    const accessToken = String(detailForm.getFieldValue('token') || '').trim()
+    if (!accessToken) {
+      message.warning('当前没有 Access Token 可复制')
+      return
+    }
+    copyText(accessToken)
+  }
+
+  const handleDetailChatgptAction = async (
+    actionId: 'relogin' | 'reauthorize_rt',
+    actionLabel: string,
+  ) => {
     if (!currentAccount || currentPlatform !== 'chatgpt') return
 
-    const toastKey = `detail-relogin:${currentAccount.id}`
-    setDetailActionLoading('relogin')
-    message.loading({ content: '二次登录进行中...', key: toastKey, duration: 0 })
+    const toastKey = `detail-${actionId}:${currentAccount.id}`
+    setDetailActionLoading(actionId)
+    message.loading({ content: `${actionLabel}进行中...`, key: toastKey, duration: 0 })
 
     try {
-      const result = await apiFetch(`/actions/${currentPlatform}/${currentAccount.id}/relogin`, {
+      const result = await apiFetch(`/actions/${currentPlatform}/${currentAccount.id}/${actionId}/task`, {
         method: 'POST',
         body: JSON.stringify({ params: {} }),
       })
-
-      if (!result?.ok) {
-        message.error({ content: result?.error || '二次登录失败', key: toastKey })
-        const failureText = appendActionLogsToText(
-          String(result?.error || result?.data?.message || '二次登录失败'),
-          result?.data?.logs,
-        )
-        Modal.info({
-          title: '二次登录日志',
-          width: 760,
-          content: (
-            <pre
-              style={{
-                margin: 0,
-                maxHeight: 360,
-                overflow: 'auto',
-                padding: 12,
-                borderRadius: 8,
-                background: 'rgba(127,127,127,0.08)',
-                fontSize: 12,
-                lineHeight: 1.5,
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-              }}
-            >
-              {failureText}
-            </pre>
-          ),
-        })
-        return
+      const taskId = String(result?.task_id || '').trim()
+      if (!taskId) {
+        throw new Error('未返回任务 ID')
       }
-
-      const refreshedItems = await load()
-      const refreshedAccount = Array.isArray(refreshedItems)
-        ? refreshedItems.find((item: any) => item.id === currentAccount.id) || null
-        : null
-      if (refreshedAccount) {
-        setCurrentAccount(refreshedAccount)
-      }
-
-      const authState = result?.data?.probe?.auth?.state || 'unknown'
-      message.success({ content: `二次登录完成，认证状态: ${authState}`, key: toastKey })
-      const successText = appendActionLogsToText(
-        String(result?.data?.message || `二次登录完成，认证状态: ${authState}`),
-        result?.data?.logs,
+      openActionTaskLog(
+        taskId,
+        String(result?.title || `${actionLabel} · ${currentAccount.email || ''}`),
+        Number(currentAccount.id || 0),
       )
-      Modal.info({
-        title: '二次登录日志',
-        width: 760,
-        content: (
-          <pre
-            style={{
-              margin: 0,
-              maxHeight: 360,
-              overflow: 'auto',
-              padding: 12,
-              borderRadius: 8,
-              background: 'rgba(127,127,127,0.08)',
-              fontSize: 12,
-              lineHeight: 1.5,
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-word',
-            }}
-          >
-            {successText}
-          </pre>
-        ),
-      })
+      message.success({ content: `${actionLabel}已启动，可实时查看日志`, key: toastKey })
     } catch (e: any) {
-      message.error({ content: `二次登录失败: ${e.message}`, key: toastKey })
+      message.error({ content: `${actionLabel}失败: ${e.message}`, key: toastKey })
     } finally {
       setDetailActionLoading('')
     }
+  }
+
+  const handleDetailRelogin = async () => {
+    await handleDetailChatgptAction('relogin', '二次登录')
+  }
+
+  const handleDetailReauthorizeRt = async () => {
+    await handleDetailChatgptAction('reauthorize_rt', '重新授权 RT')
+  }
+
+  const loadMailboxMessages = useCallback(async (account: any, folder = 'inbox') => {
+    if (!account?.id) return
+
+    setMailboxLoading(true)
+    setMailboxError('')
+    try {
+      const params = new URLSearchParams({
+        folder,
+        limit: '25',
+      })
+      const result = await apiFetch(`/accounts/${account.id}/mailbox?${params.toString()}`) as AccountMailboxResponse
+      setMailboxData(result)
+      setSelectedMailboxMessageId((currentId) => {
+        if (currentId && result.messages.some((item) => item.id === currentId)) {
+          return currentId
+        }
+        return result.messages[0]?.id || ''
+      })
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : '加载邮件失败'
+      setMailboxData(null)
+      setSelectedMailboxMessageId('')
+      setMailboxError(detail)
+    } finally {
+      setMailboxLoading(false)
+    }
+  }, [])
+
+  const handleOpenMailbox = (account: any) => {
+    setMailboxViewerAccount(account)
+    setMailboxModalOpen(true)
+    setMailboxData(null)
+    setMailboxError('')
+    setSelectedMailboxMessageId('')
+    void loadMailboxMessages(account, 'inbox')
+  }
+
+  const handleMailboxFolderChange = (folder: string) => {
+    if (!mailboxViewerAccount) return
+    setSelectedMailboxMessageId('')
+    void loadMailboxMessages(mailboxViewerAccount, folder)
+  }
+
+  const handleMailboxRefresh = () => {
+    if (!mailboxViewerAccount) return
+    void loadMailboxMessages(mailboxViewerAccount, mailboxData?.active_folder || 'inbox')
   }
 
   const showCpaSyncResult = (title: string, result: any) => {
@@ -1141,6 +1290,8 @@ export default function Accounts() {
         ? 'sync_cliproxyapi_status'
         : kind === 'refresh'
         ? 'refresh_token'
+        : kind === 'reauthorize_rt'
+        ? 'reauthorize_rt'
         : 'relogin'
     const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
     const toastKey = `status-sync:${loadingKey}`
@@ -1250,6 +1401,8 @@ export default function Accounts() {
 
   const getUploadCpaScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
+  const getExportScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
+
   const backfillButtonLabel = () => {
     const scope = getBackfillScope()
     const count = scope === 'selected' ? selectedRowKeys.length : total
@@ -1260,6 +1413,12 @@ export default function Accounts() {
     const scope = getUploadCpaScope()
     const count = scope === 'selected' ? selectedRowKeys.length : total
     return scope === 'selected' ? `导入所选 CPA (${count})` : `导入筛选 CPA (${count})`
+  }
+
+  const exportScopeLabel = () => {
+    const scope = getExportScope()
+    const count = scope === 'selected' ? selectedRowKeys.length : total
+    return scope === 'selected' ? `导出所选 (${count})` : `导出筛选 (${count})`
   }
 
   const isChatgptPlatform = currentPlatform === 'chatgpt'
@@ -1293,6 +1452,9 @@ export default function Accounts() {
     border: `1px solid ${token.colorBorder}`,
     background: token.colorFillAlter,
   }
+  const selectedMailboxMessage = mailboxData?.messages.find((item) => item.id === selectedMailboxMessageId)
+    || mailboxData?.messages[0]
+    || null
 
   const columns: any[] = [
     {
@@ -1381,7 +1543,7 @@ export default function Accounts() {
             <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                 <Tag color={authMeta.color}>{authMeta.label}</Tag>
-                <Tag color={planTag.color}>{planTag.label}</Tag>
+                <Tag color={planTag.color}>套餐 {planTag.label}</Tag>
                 <Tag color={codexMeta.color}>Codex {codexMeta.label}</Tag>
                 {promo.state ? <Tag color={promoMeta.color}>{promoMeta.label}</Tag> : null}
               </div>
@@ -1475,10 +1637,20 @@ export default function Accounts() {
     {
       title: '操作',
       key: 'action',
-      width: 150,
+      width: 210,
       fixed: isChatgptPlatform ? 'right' : undefined,
       render: (_: any, record: any) => (
         <Space size={4} wrap>
+          {isChatgptPlatform && supportsMailboxViewer(record) ? (
+            <Button
+              type="link"
+              size="small"
+              icon={<MailOutlined />}
+              onClick={() => handleOpenMailbox(record)}
+            >
+              邮件
+            </Button>
+          ) : null}
           <Button type="link" size="small" onClick={() => { setCurrentAccount(record); setDetailModalOpen(true); }}>
             详情
           </Button>
@@ -1493,7 +1665,12 @@ export default function Accounts() {
               删除
             </Button>
           </Popconfirm>
-          <ActionMenu acc={record} onRefresh={load} actions={platformActions} />
+          <ActionMenu
+            acc={record}
+            onRefresh={load}
+            actions={platformActions}
+            onOpenTaskLog={openActionTaskLog}
+          />
         </Space>
       ),
     },
@@ -1538,6 +1715,14 @@ export default function Accounts() {
         getStatusSyncScope() === 'selected'
           ? `二次登录所选账号 (${selectedRowKeys.length})`
           : `二次登录当前筛选账号 (${total})`,
+      disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
+    },
+    {
+      key: `reauthorize_rt:${getStatusSyncScope()}`,
+      label:
+        getStatusSyncScope() === 'selected'
+          ? `重新授权 RT 所选账号 (${selectedRowKeys.length})`
+          : `重新授权 RT 当前筛选账号 (${total})`,
       disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
     },
   ]
@@ -1655,7 +1840,44 @@ export default function Accounts() {
             </Popconfirm>
           )}
           <Button icon={<UploadOutlined />} onClick={() => setImportModalOpen(true)}>导入</Button>
-          <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={accounts.length === 0}>导出</Button>
+          <Dropdown
+            trigger={['click']}
+            menu={{
+              items: [
+                {
+                  key: 'csv',
+                  label: `${getExportScope() === 'selected' ? '所选' : '筛选'} CSV (${getExportScope() === 'selected' ? selectedRowKeys.length : total})`,
+                },
+                {
+                  key: 'json',
+                  label: `${getExportScope() === 'selected' ? '所选' : '筛选'} JSON (${getExportScope() === 'selected' ? selectedRowKeys.length : total})`,
+                },
+                {
+                  key: 'txt',
+                  label: `${getExportScope() === 'selected' ? '所选' : '筛选'} TXT (${getExportScope() === 'selected' ? selectedRowKeys.length : total})`,
+                },
+                ...(currentPlatform === 'chatgpt'
+                  ? [
+                      {
+                        key: 'cpa',
+                        label: `${getExportScope() === 'selected' ? '所选' : '筛选'} CPA ZIP (${getExportScope() === 'selected' ? selectedRowKeys.length : total})`,
+                      },
+                      {
+                        key: 'sub2api',
+                        label: `${getExportScope() === 'selected' ? '所选' : '筛选'} Sub2API JSON (${getExportScope() === 'selected' ? selectedRowKeys.length : total})`,
+                      },
+                    ]
+                  : []),
+              ],
+              onClick: ({ key }) => {
+                void downloadExport(String(key) as ExportFormat)
+              },
+            }}
+          >
+            <Button icon={<DownloadOutlined />} loading={exportLoading !== ''} disabled={total === 0}>
+              {exportScopeLabel()}
+            </Button>
+          </Dropdown>
           <Button icon={<PlusOutlined />} onClick={() => setAddModalOpen(true)}>新增</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>注册</Button>
           <Button icon={<ReloadOutlined spin={loading} />} onClick={load} />
@@ -1803,6 +2025,11 @@ export default function Accounts() {
               <Form.Item name="token" label="Access Token">
                 <Input.TextArea rows={2} style={{ fontFamily: 'monospace' }} />
               </Form.Item>
+              <div style={{ marginTop: -12, marginBottom: 8, display: 'flex', justifyContent: 'flex-end' }}>
+                <Button size="small" icon={<CopyOutlined />} onClick={handleCopyDetailAccessToken}>
+                  复制 AT
+                </Button>
+              </div>
             </Form>
             {(() => {
               const rt = getRefreshToken(currentAccount)
@@ -1845,18 +2072,48 @@ export default function Accounts() {
                     type="warning"
                     showIcon
                     message="检测到当前 Access Token 已失效"
-                    description="可以直接尝试一次二次登录，重新获取新的 Token，并刷新本地探测结果。"
+                    description="可以先尝试二次登录恢复登录态；如果你想明确重走 OAuth 并重新拿一套 AT+RT，也可以直接点“重新授权 RT”。点击后会打开实时日志面板。"
                     action={
+                      <Space>
+                        <Button
+                          size="small"
+                          type="primary"
+                          loading={detailActionLoading === 'relogin'}
+                          onClick={handleDetailRelogin}
+                        >
+                          二次登录
+                        </Button>
+                        <Button
+                          size="small"
+                          loading={detailActionLoading === 'reauthorize_rt'}
+                          onClick={handleDetailReauthorizeRt}
+                        >
+                          重新授权 RT
+                        </Button>
+                      </Space>
+                    }
+                  />
+                ) : null}
+                {canRunChatgptRelogin(currentAccount) && !shouldOfferChatgptRelogin(currentAccount) ? (
+                  <div style={{ marginBottom: 12 }}>
+                    <Space wrap>
                       <Button
-                        size="small"
-                        type="primary"
                         loading={detailActionLoading === 'relogin'}
                         onClick={handleDetailRelogin}
                       >
                         二次登录
                       </Button>
-                    }
-                  />
+                      <Button
+                        loading={detailActionLoading === 'reauthorize_rt'}
+                        onClick={handleDetailReauthorizeRt}
+                      >
+                        重新授权 RT
+                      </Button>
+                      <Text type="secondary">
+                        二次登录偏恢复当前登录态；重新授权 RT 会明确重走 OAuth，并重新获取一套新的 AT+RT。两者都会打开实时日志面板。
+                      </Text>
+                    </Space>
+                  </div>
                 ) : null}
                 {currentAccount.chatgptLocal && Object.keys(currentAccount.chatgptLocal).length > 0 ? (
                   <LocalProbeSummary probe={currentAccount.chatgptLocal} />
@@ -1876,6 +2133,220 @@ export default function Accounts() {
             ) : null}
           </>
         )}
+      </Modal>
+
+      <Modal
+        title={actionTaskTitle || '账号操作日志'}
+        open={actionTaskModalOpen}
+        onCancel={() => {
+          setActionTaskModalOpen(false)
+          setActionTaskId(null)
+          setActionTaskTitle('')
+          setActionTaskAccountId(null)
+        }}
+        footer={[
+          <Button
+            key="close"
+            type="primary"
+            onClick={() => {
+              setActionTaskModalOpen(false)
+              setActionTaskId(null)
+              setActionTaskTitle('')
+              setActionTaskAccountId(null)
+            }}
+          >
+            关闭
+          </Button>,
+        ]}
+        width={820}
+        maskClosable={false}
+        destroyOnClose
+      >
+        {actionTaskId ? (
+          <TaskLogPanel taskId={actionTaskId} onDone={handleActionTaskDone} />
+        ) : (
+          <Empty description="暂无日志任务" />
+        )}
+      </Modal>
+
+      <Modal
+        title={`账号邮箱 · ${mailboxViewerAccount?.email || ''}`}
+        open={mailboxModalOpen}
+        onCancel={() => {
+          setMailboxModalOpen(false)
+          setMailboxViewerAccount(null)
+          setMailboxData(null)
+          setMailboxError('')
+          setSelectedMailboxMessageId('')
+        }}
+        footer={[
+          <Button key="close" type="primary" onClick={() => setMailboxModalOpen(false)}>
+            关闭
+          </Button>,
+        ]}
+        width={1080}
+        maskClosable={false}
+        styles={{
+          body: {
+            height: '74vh',
+            maxHeight: '74vh',
+            overflow: 'hidden',
+            display: 'flex',
+            flexDirection: 'column',
+          },
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+          <Space wrap>
+            <Tag color="blue">微软邮箱</Tag>
+            {mailboxData?.backend ? <Tag>{mailboxBackendLabel(mailboxData.backend)}</Tag> : null}
+            {mailboxData?.limit ? <Text type="secondary">显示最近 {mailboxData.limit} 封</Text> : null}
+          </Space>
+          <Button
+            icon={<ReloadOutlined spin={mailboxLoading} />}
+            loading={mailboxLoading}
+            onClick={handleMailboxRefresh}
+            disabled={!mailboxViewerAccount}
+          >
+            刷新
+          </Button>
+        </div>
+
+        {mailboxData?.folders?.length ? (
+          <Space wrap style={{ marginBottom: 12 }}>
+            {mailboxData.folders.map((folder) => (
+              <Button
+                key={folder.key}
+                type={mailboxData.active_folder === folder.key ? 'primary' : 'default'}
+                onClick={() => handleMailboxFolderChange(folder.key)}
+                disabled={mailboxLoading}
+              >
+                {folder.label}
+              </Button>
+            ))}
+          </Space>
+        ) : null}
+
+        {mailboxError ? (
+          <Alert
+            type="error"
+            showIcon
+            message="邮件加载失败"
+            description={mailboxError}
+            style={{ marginBottom: 12 }}
+          />
+        ) : null}
+
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '320px minmax(0, 1fr)',
+            gap: 12,
+            flex: 1,
+            minHeight: 0,
+          }}
+        >
+          <div
+            style={{
+              border: `1px solid ${token.colorBorder}`,
+              borderRadius: token.borderRadiusLG,
+              background: token.colorFillAlter,
+              minHeight: 0,
+              overflow: 'auto',
+            }}
+          >
+            {mailboxData?.messages?.length ? (
+              mailboxData.messages.map((item) => {
+                const active = selectedMailboxMessage?.id === item.id
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => setSelectedMailboxMessageId(item.id)}
+                    style={{
+                      width: '100%',
+                      textAlign: 'left',
+                      border: 'none',
+                      borderBottom: `1px solid ${token.colorBorderSecondary}`,
+                      background: active ? token.colorPrimaryBg : 'transparent',
+                      padding: 12,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div style={{ fontWeight: 600, marginBottom: 6, lineHeight: 1.4 }}>{item.subject || '(无主题)'}</div>
+                    <div style={{ fontSize: 12, color: token.colorTextSecondary, marginBottom: 6 }}>
+                      {item.sender || '-'}
+                    </div>
+                    <div style={{ fontSize: 12, color: token.colorTextSecondary, lineHeight: 1.5 }}>
+                      {item.preview || '暂无预览'}
+                    </div>
+                    {item.received_at ? (
+                      <div style={{ fontSize: 11, color: token.colorTextTertiary, marginTop: 8 }}>
+                        {formatSyncTime(item.received_at)}
+                      </div>
+                    ) : null}
+                  </button>
+                )
+              })
+            ) : (
+              <div style={{ minHeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description={mailboxLoading ? '正在加载邮件…' : '当前文件夹暂无邮件'}
+                />
+              </div>
+            )}
+          </div>
+
+          <div
+            style={{
+              border: `1px solid ${token.colorBorder}`,
+              borderRadius: token.borderRadiusLG,
+              background: token.colorBgElevated,
+              padding: 14,
+              minHeight: 0,
+              overflow: 'auto',
+            }}
+          >
+            {selectedMailboxMessage ? (
+              <>
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 18, fontWeight: 700, lineHeight: 1.4, marginBottom: 8 }}>
+                    {selectedMailboxMessage.subject || '(无主题)'}
+                  </div>
+                  <div style={{ fontSize: 13, color: token.colorTextSecondary, marginBottom: 4 }}>
+                    发件人: {selectedMailboxMessage.sender || '-'}
+                    {selectedMailboxMessage.sender_address ? ` <${selectedMailboxMessage.sender_address}>` : ''}
+                  </div>
+                  {selectedMailboxMessage.received_at ? (
+                    <div style={{ fontSize: 12, color: token.colorTextTertiary }}>
+                      时间: {formatSyncTime(selectedMailboxMessage.received_at)}
+                    </div>
+                  ) : null}
+                </div>
+                <pre
+                  style={{
+                    margin: 0,
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+                    fontSize: 12,
+                    lineHeight: 1.6,
+                  }}
+                >
+                  {selectedMailboxMessage.body || selectedMailboxMessage.preview || '暂无正文'}
+                </pre>
+              </>
+            ) : (
+              <div style={{ minHeight: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description={mailboxError ? '邮箱加载失败' : '请选择一封邮件'}
+                />
+              </div>
+            )}
+          </div>
+        </div>
       </Modal>
     </div>
   )
