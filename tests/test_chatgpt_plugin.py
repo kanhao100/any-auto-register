@@ -1,8 +1,17 @@
+import sys
+import types
 import unittest
 from unittest import mock
 
+try:
+    import curl_cffi  # noqa: F401
+except ModuleNotFoundError:
+    curl_cffi_module = types.ModuleType("curl_cffi")
+    curl_cffi_module.requests = types.SimpleNamespace(get=None, post=None)
+    sys.modules["curl_cffi"] = curl_cffi_module
+
 from core.base_mailbox import MailboxAccount
-from core.base_platform import RegisterConfig
+from core.base_platform import Account, AccountStatus, RegisterConfig
 from platforms.chatgpt.plugin import ChatGPTPlatform
 
 
@@ -72,7 +81,41 @@ class _FailingAdapter:
         return mock.Mock(success=False, error_message="boom")
 
 
+class _SuccessfulAccountAdapter:
+    def run(self, context):
+        context.email_service.create_email()
+        return mock.Mock(success=True)
+
+    def build_account(self, result, fallback_password):
+        return Account(
+            platform="chatgpt",
+            email="demo@example.com",
+            password=fallback_password,
+            token="",
+            status=AccountStatus.REGISTERED,
+            extra={},
+        )
+
+
 class ChatGPTPluginTests(unittest.TestCase):
+    def test_platform_actions_include_promo_probe(self):
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+        )
+
+        actions = platform.get_platform_actions()
+
+        self.assertTrue(any(action["id"] == "probe_promo_eligibility" for action in actions))
+
+    def test_platform_actions_include_relogin(self):
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+        )
+
+        actions = platform.get_platform_actions()
+
+        self.assertTrue(any(action["id"] == "relogin" for action in actions))
+
     def test_custom_provider_rejects_blank_email(self):
         platform = ChatGPTPlatform(
             config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
@@ -149,6 +192,165 @@ class ChatGPTPluginTests(unittest.TestCase):
                 platform.register()
 
         self.assertEqual(mailbox.requeued, [])
+
+    def test_register_stores_mailbox_snapshot_in_account_extra(self):
+        mailbox = _TrackingMailbox()
+        mailbox.account.extra = {"provider": "microsoft", "tenant": "demo"}
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+            mailbox=mailbox,
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=_SuccessfulAccountAdapter(),
+        ):
+            account = platform.register()
+
+        self.assertIsInstance(account, Account)
+        self.assertEqual(account.extra["mailbox_account"]["email"], "demo@example.com")
+        self.assertEqual(account.extra["mailbox_account"]["account_id"], "tracked-mailbox")
+        self.assertEqual(
+            account.extra["mailbox_account"]["extra"],
+            {"provider": "microsoft", "tenant": "demo"},
+        )
+
+    def test_execute_action_probe_promo_eligibility_merges_local_probe(self):
+        platform = ChatGPTPlatform(config=RegisterConfig())
+        account = Account(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="secret",
+            token="access-token",
+            status=AccountStatus.REGISTERED,
+            extra={
+                "access_token": "access-token",
+                "chatgpt_local": {
+                    "auth": {"state": "access_token_valid"},
+                },
+            },
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.payment.probe_plus_promo_eligibility",
+            return_value={
+                "state": "eligible",
+                "eligible": True,
+                "country": "ID",
+                "offer_title": "Plus 优惠",
+                "subscription_plan": "free",
+                "message": "ok",
+            },
+        ):
+            result = platform.execute_action("probe_promo_eligibility", account, {})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["promo"]["state"], "eligible")
+        self.assertEqual(result["data"]["probe"]["auth"]["state"], "access_token_valid")
+        self.assertEqual(result["account_extra_patch"]["chatgpt_local"]["promo"]["country"], "ID")
+
+    def test_execute_action_relogin_returns_tokens_and_probe_patch(self):
+        platform = ChatGPTPlatform(config=RegisterConfig(extra={"default_executor": "headed"}))
+        account = Account(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="secret",
+            token="stale-access-token",
+            status=AccountStatus.INVALID,
+            extra={
+                "access_token": "stale-access-token",
+                "refresh_token": "stale-refresh-token",
+            },
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.relogin_chatgpt_account",
+            return_value={
+                "access_token": "fresh-access-token",
+                "refresh_token": "fresh-refresh-token",
+                "id_token": "fresh-id-token",
+                "session_token": "fresh-session-token",
+                "workspace_id": "ws_123",
+                "probe": {
+                    "auth": {"state": "access_token_valid", "http_status": 200},
+                    "subscription": {"plan": "free"},
+                    "codex": {"state": "usable"},
+                },
+                "relogin_method": "password",
+                "mailbox": {"available": False},
+            },
+        ) as relogin_mock:
+            result = platform.execute_action("relogin", account, {})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["access_token"], "fresh-access-token")
+        self.assertEqual(result["data"]["refresh_token"], "fresh-refresh-token")
+        self.assertEqual(result["data"]["probe"]["auth"]["state"], "access_token_valid")
+        self.assertEqual(result["account_extra_patch"]["chatgpt_token_source"], "relogin")
+        self.assertEqual(result["account_extra_patch"]["chatgpt_last_relogin"]["method"], "password")
+        relogin_mock.assert_called_once()
+
+    def test_execute_action_relogin_includes_action_logs(self):
+        platform = ChatGPTPlatform(config=RegisterConfig())
+        account = Account(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="secret",
+            token="stale-access-token",
+            status=AccountStatus.INVALID,
+            extra={"access_token": "stale-access-token"},
+        )
+
+        def _fake_relogin(*args, **kwargs):
+            kwargs["log_fn"]("[relogin] step 1")
+            kwargs["log_fn"]("[relogin] step 2")
+            return {
+                "access_token": "fresh-access-token",
+                "refresh_token": "fresh-refresh-token",
+                "id_token": "fresh-id-token",
+                "session_token": "fresh-session-token",
+                "workspace_id": "ws_123",
+                "probe": {
+                    "auth": {"state": "access_token_valid", "http_status": 200},
+                    "subscription": {"plan": "free"},
+                    "codex": {"state": "usable"},
+                },
+                "relogin_method": "password",
+                "mailbox": {"available": False},
+            }
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.relogin_chatgpt_account",
+            side_effect=_fake_relogin,
+        ):
+            result = platform.execute_action("relogin", account, {})
+
+        self.assertEqual(result["data"]["logs"], ["[relogin] step 1", "[relogin] step 2"])
+
+    def test_execute_action_relogin_returns_logs_on_failure(self):
+        platform = ChatGPTPlatform(config=RegisterConfig())
+        account = Account(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="secret",
+            token="stale-access-token",
+            status=AccountStatus.INVALID,
+            extra={"access_token": "stale-access-token"},
+        )
+
+        def _failing_relogin(*args, **kwargs):
+            kwargs["log_fn"]("[relogin] step before failure")
+            raise RuntimeError("boom")
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.relogin_chatgpt_account",
+            side_effect=_failing_relogin,
+        ):
+            result = platform.execute_action("relogin", account, {})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "boom")
+        self.assertEqual(result["data"]["logs"], ["[relogin] step before failure"])
 
 
 if __name__ == "__main__":

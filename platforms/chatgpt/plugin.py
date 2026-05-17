@@ -1,4 +1,4 @@
-"""ChatGPT / Codex CLI 平台插件"""
+"""ChatGPT / Codex CLI platform plugin."""
 
 import random
 import string
@@ -10,6 +10,15 @@ from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
 )
+from platforms.chatgpt.relogin import relogin_chatgpt_account, snapshot_mailbox_account
+
+
+def _merge_local_probe(existing: dict | None, **patch: dict) -> dict:
+    merged = dict(existing or {})
+    for key, value in patch.items():
+        if isinstance(value, dict):
+            merged[key] = value
+    return merged
 
 
 @register
@@ -33,18 +42,35 @@ class ChatGPTPlatform(BasePlatform):
             extra = account.extra or {}
             a.access_token = extra.get("access_token") or account.token
             a.cookies = extra.get("cookies", "")
-            status = check_subscription_status(a, proxy=self.config.proxy if self.config else None)
+            status = check_subscription_status(
+                a,
+                proxy=self.config.proxy if self.config else None,
+            )
             return status not in ("expired", "invalid", "banned", None)
         except Exception:
             return False
 
+    @staticmethod
+    def _attach_mailbox_snapshot(account_obj, email_service) -> None:
+        if not hasattr(account_obj, "extra") or not isinstance(account_obj.extra, dict):
+            return
+        mailbox_snapshot = snapshot_mailbox_account(getattr(email_service, "_acct", None))
+        if mailbox_snapshot:
+            account_obj.extra.setdefault("mailbox_account", mailbox_snapshot)
+
     def register(self, email: str = None, password: str = None) -> Account:
         if not password:
-            password = "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=16))
+            password = "".join(
+                random.choices(string.ascii_letters + string.digits + "!@#$", k=16)
+            )
 
         proxy = self.config.proxy if self.config else None
         browser_mode = (self.config.executor_type if self.config else None) or "protocol"
-        extra_config = (self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {}
+        extra_config = (
+            (self.config.extra or {})
+            if self.config and getattr(self.config, "extra", None)
+            else {}
+        )
         log_fn = getattr(self, "_log_fn", print)
         max_retries = 3
         try:
@@ -90,7 +116,11 @@ class ChatGPTPlatform(BasePlatform):
 
                 def create_email(self, config=None):
                     if self._email and self._acct and _fixed_email:
-                        return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
+                        return {
+                            "email": self._email,
+                            "service_id": self._acct.account_id,
+                            "token": "",
+                        }
                     self._acct = _mailbox.get_email()
                     get_current_ids = getattr(_mailbox, "get_current_ids", None)
                     if callable(get_current_ids):
@@ -102,7 +132,11 @@ class ChatGPTPlatform(BasePlatform):
                         self._email = _resolve_email(generated_email)
                     elif not _fixed_email:
                         self._email = _resolve_email(generated_email)
-                    return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
+                    return {
+                        "email": self._email,
+                        "service_id": self._acct.account_id,
+                        "token": "",
+                    }
 
                 def get_verification_code(
                     self,
@@ -152,7 +186,11 @@ class ChatGPTPlatform(BasePlatform):
                     resolved_email = str(getattr(acct, "email", "") or "").strip()
                     if not resolved_email:
                         raise RuntimeError("tempmail_lol 返回空邮箱地址")
-                    return {"email": resolved_email, "service_id": acct.account_id, "token": acct.account_id}
+                    return {
+                        "email": resolved_email,
+                        "service_id": acct.account_id,
+                        "token": acct.account_id,
+                    }
 
                 def get_verification_code(
                     self,
@@ -196,19 +234,33 @@ class ChatGPTPlatform(BasePlatform):
         if not result or not result.success:
             raise RuntimeError(result.error_message if result else "注册失败")
 
-        return adapter.build_account(result, password)
+        account_obj = adapter.build_account(result, password)
+        self._attach_mailbox_snapshot(account_obj, email_service)
+        return account_obj
 
     def get_platform_actions(self) -> list:
         return [
             {"id": "probe_local_status", "label": "探测本地状态", "params": []},
+            {"id": "probe_promo_eligibility", "label": "检测 Plus 优惠资格", "params": []},
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
+            {"id": "relogin", "label": "二次登录取 Token", "params": []},
             {
                 "id": "payment_link",
-                "label": "生成支付链接",
+                "label": "生成 Plus GoPay 长链接",
                 "params": [
-                    {"key": "country", "label": "地区", "type": "select", "options": ["US", "SG", "TR", "HK", "JP", "GB", "AU", "CA"]},
-                    {"key": "plan", "label": "套餐", "type": "select", "options": ["plus", "team"]},
+                    {
+                        "key": "country",
+                        "label": "地区",
+                        "type": "select",
+                        "options": ["ID", "US", "SG", "TR", "HK", "JP", "GB", "AU", "CA"],
+                    },
+                    {
+                        "key": "plan",
+                        "label": "套餐",
+                        "type": "select",
+                        "options": ["plus", "team"],
+                    },
                 ],
             },
             {
@@ -254,6 +306,7 @@ class ChatGPTPlatform(BasePlatform):
 
         a = _A()
         a.email = account.email
+        a.password = account.password
         a.access_token = extra.get("access_token") or account.token
         a.refresh_token = extra.get("refresh_token", "")
         a.id_token = extra.get("id_token", "")
@@ -261,6 +314,7 @@ class ChatGPTPlatform(BasePlatform):
         a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
         a.cookies = extra.get("cookies", "")
         a.user_id = account.user_id
+        a.extra = extra
 
         if action_id == "probe_local_status":
             from platforms.chatgpt.status_probe import probe_local_chatgpt_status
@@ -282,11 +336,41 @@ class ChatGPTPlatform(BasePlatform):
                 },
             }
 
+        if action_id == "probe_promo_eligibility":
+            from platforms.chatgpt.payment import probe_plus_promo_eligibility
+
+            promo_result = probe_plus_promo_eligibility(
+                a,
+                proxy=proxy,
+                country=str(params.get("country", "ID") or "ID").strip().upper(),
+            )
+            local_probe = _merge_local_probe(extra.get("chatgpt_local"), promo=promo_result)
+            summary = (
+                f"优惠={promo_result.get('state', 'unknown')}, "
+                f"plan={promo_result.get('subscription_plan', 'unknown')}"
+            )
+            return {
+                "ok": promo_result.get("state")
+                not in {"probe_failed", "unauthorized", "missing_access_token"},
+                "data": {
+                    "message": f"Plus 优惠资格探测完成：{summary}",
+                    "probe": local_probe,
+                    "promo": promo_result,
+                },
+                "error": promo_result.get("message", ""),
+                "account_extra_patch": {
+                    "chatgpt_local": local_probe,
+                },
+            }
+
         if action_id == "sync_cliproxyapi_status":
             from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status
 
             sync_result = sync_chatgpt_cliproxyapi_status(a)
-            ok = bool(sync_result.get("uploaded")) and sync_result.get("remote_state") not in {"unreachable", "not_found"}
+            ok = bool(sync_result.get("uploaded")) and sync_result.get("remote_state") not in {
+                "unreachable",
+                "not_found",
+            }
             summary = (
                 f"远端状态={sync_result.get('status') or 'not_found'}, "
                 f"探测={sync_result.get('remote_state') or 'not_checked'}"
@@ -320,11 +404,76 @@ class ChatGPTPlatform(BasePlatform):
                 }
             return {"ok": False, "error": result.error_message}
 
+        if action_id == "relogin":
+            outer_log_fn = getattr(self, "_log_fn", None)
+            relogin_logs: list[str] = []
+
+            def _capture_relogin_log(message: str) -> None:
+                text = str(message or "").strip()
+                if not text:
+                    return
+                relogin_logs.append(text)
+                if callable(outer_log_fn):
+                    outer_log_fn(text)
+
+            try:
+                relogin_result = relogin_chatgpt_account(
+                    a,
+                    config=self.config.extra if self.config else {},
+                    proxy=proxy,
+                    browser_mode=(
+                        (self.config.executor_type if self.config else None)
+                        or ((self.config.extra or {}).get("default_executor") if self.config else None)
+                        or "protocol"
+                    ),
+                    log_fn=_capture_relogin_log,
+                )
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": str(exc),
+                    "data": {
+                        "message": f"二次登录失败: {exc}",
+                        "logs": relogin_logs,
+                    },
+                }
+            probe_result = (
+                relogin_result.get("probe")
+                if isinstance(relogin_result.get("probe"), dict)
+                else {}
+            )
+            summary = (
+                f"认证={probe_result.get('auth', {}).get('state', 'unknown')}, "
+                f"订阅={probe_result.get('subscription', {}).get('plan', 'unknown')}, "
+                f"Codex={probe_result.get('codex', {}).get('state', 'unknown')}"
+            )
+            return {
+                "ok": True,
+                "data": {
+                    "access_token": relogin_result.get("access_token", ""),
+                    "refresh_token": relogin_result.get("refresh_token", ""),
+                    "id_token": relogin_result.get("id_token", ""),
+                    "session_token": relogin_result.get("session_token", ""),
+                    "workspace_id": relogin_result.get("workspace_id", ""),
+                    "message": f"二次登录完成：{summary}",
+                    "probe": probe_result,
+                    "logs": relogin_logs,
+                },
+                "account_extra_patch": {
+                    "chatgpt_local": probe_result,
+                    "chatgpt_last_relogin": {
+                        "method": relogin_result.get("relogin_method", ""),
+                        "mailbox": relogin_result.get("mailbox", {}),
+                    },
+                    "chatgpt_token_source": "relogin",
+                },
+            }
+
         if action_id == "payment_link":
             from platforms.chatgpt.payment import generate_plus_link, generate_team_link
 
             plan = params.get("plan", "plus")
-            country = params.get("country", "US")
+            country = params.get("country", "ID")
             if plan == "plus":
                 url = generate_plus_link(a, proxy=proxy, country=country)
             else:

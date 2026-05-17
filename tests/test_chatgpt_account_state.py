@@ -79,6 +79,32 @@ class ChatGPTAccountStateTests(unittest.TestCase):
             "auth_deactivated",
         )
 
+    def test_valid_probe_recovers_invalid_to_registered(self):
+        account = DummyAccount(status="invalid")
+        reason = apply_chatgpt_status_policy(
+            account,
+            local_probe={
+                "auth": {"state": "access_token_valid", "http_status": 200},
+                "subscription": {"plan": "free"},
+            },
+        )
+
+        self.assertEqual(reason, "")
+        self.assertEqual(account.status, "registered")
+
+    def test_valid_paid_probe_recovers_invalid_to_subscribed(self):
+        account = DummyAccount(status="invalid")
+        reason = apply_chatgpt_status_policy(
+            account,
+            local_probe={
+                "auth": {"state": "access_token_valid", "http_status": 200},
+                "subscription": {"plan": "plus"},
+            },
+        )
+
+        self.assertEqual(reason, "")
+        self.assertEqual(account.status, "subscribed")
+
 
 if __name__ == "__main__":
     unittest.main()

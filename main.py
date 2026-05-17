@@ -15,6 +15,7 @@ from api.platforms import router as platforms_router
 from api.proxies import router as proxies_router
 from api.config import router as config_router
 from api.actions import router as actions_router
+from api.chatgpt import router as chatgpt_router
 from api.integrations import router as integrations_router
 from api.auth import router as auth_router
 from api.mail_imports import router as mail_imports_router
@@ -109,6 +110,7 @@ app.include_router(platforms_router, prefix="/api")
 app.include_router(proxies_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(actions_router, prefix="/api")
+app.include_router(chatgpt_router, prefix="/api")
 app.include_router(integrations_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(mail_imports_router, prefix="/api")

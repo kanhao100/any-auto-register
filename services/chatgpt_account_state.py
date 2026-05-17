@@ -1,4 +1,4 @@
-"""ChatGPT 账号状态判定辅助逻辑。"""
+"""Helpers for applying ChatGPT account-state policy."""
 
 from __future__ import annotations
 
@@ -66,7 +66,11 @@ def classify_remote_sync_state(sync: dict[str, Any] | None) -> str:
     remote_state = _lower_text(sync.get("remote_state"))
     status_code = int(sync.get("last_probe_status_code") or 0)
     error_code = sync.get("last_probe_error_code")
-    message = sync.get("last_probe_message") or sync.get("status_message") or sync.get("message")
+    message = (
+        sync.get("last_probe_message")
+        or sync.get("status_message")
+        or sync.get("message")
+    )
 
     if status_code == 401 or remote_state in {"access_token_invalidated", "unauthorized"}:
         return "remote_401"
@@ -78,6 +82,38 @@ def classify_remote_sync_state(sync: dict[str, Any] | None) -> str:
     return ""
 
 
+def suggest_status_from_local_probe(probe: dict[str, Any] | None) -> str:
+    if not isinstance(probe, dict):
+        return ""
+
+    auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
+    subscription = (
+        probe.get("subscription") if isinstance(probe.get("subscription"), dict) else {}
+    )
+
+    auth_state = _lower_text(auth.get("state"))
+    auth_status = int(auth.get("http_status") or 0)
+    if auth_state != "access_token_valid" and auth_status != 200:
+        return ""
+
+    plan = _lower_text(subscription.get("plan"))
+    if plan in {"plus", "team", "enterprise", "pro"}:
+        return "subscribed"
+    return "registered"
+
+
+def _recover_account_status(account: Any, local_probe: dict[str, Any] | None) -> None:
+    suggested = suggest_status_from_local_probe(local_probe)
+    if not suggested:
+        return
+
+    current = _lower_text(getattr(account, "status", ""))
+    if suggested == "subscribed" and current in {"", "invalid", "registered", "expired"}:
+        setattr(account, "status", suggested)
+    elif suggested == "registered" and current in {"", "invalid", "expired"}:
+        setattr(account, "status", suggested)
+
+
 def apply_chatgpt_status_policy(
     account: Any,
     *,
@@ -87,4 +123,7 @@ def apply_chatgpt_status_policy(
     reason = classify_local_probe_state(local_probe) or classify_remote_sync_state(remote_sync)
     if reason:
         setattr(account, "status", INVALID_ACCOUNT_STATUS)
-    return reason
+        return reason
+
+    _recover_account_status(account, local_probe)
+    return ""

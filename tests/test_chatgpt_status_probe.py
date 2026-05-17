@@ -1,5 +1,14 @@
+import sys
+import types
 import unittest
 from unittest import mock
+
+try:
+    import curl_cffi  # noqa: F401
+except ModuleNotFoundError:
+    curl_cffi_module = types.ModuleType("curl_cffi")
+    curl_cffi_module.requests = types.SimpleNamespace(get=None, post=None)
+    sys.modules["curl_cffi"] = curl_cffi_module
 
 from platforms.chatgpt.status_probe import ProbeHTTPResult, probe_local_chatgpt_status
 

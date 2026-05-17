@@ -147,6 +147,27 @@ function planMeta(plan?: string) {
   }
 }
 
+function promoStateMeta(state?: string, offerTitle = 'Plus 优惠') {
+  switch ((state || '').toLowerCase()) {
+    case 'eligible':
+      return { color: 'success', label: `${offerTitle}有效` }
+    case 'ineligible':
+      return { color: 'warning', label: `${offerTitle}无效` }
+    case 'already_subscribed':
+      return { color: 'processing', label: `已有${offerTitle}` }
+    case 'unauthorized':
+      return { color: 'error', label: `${offerTitle}检测失败` }
+    case 'missing_access_token':
+      return { color: 'default', label: `${offerTitle}缺少 AT` }
+    case 'probe_failed':
+      return { color: 'error', label: `${offerTitle}探测失败` }
+    case 'unknown':
+      return { color: 'default', label: `${offerTitle}待确认` }
+    default:
+      return { color: 'default', label: `${offerTitle}未探测` }
+  }
+}
+
 function formatStructuredText(value?: string) {
   if (!value) return ''
   const trimmed = String(value).trim()
@@ -159,6 +180,43 @@ function formatStructuredText(value?: string) {
     }
   }
   return trimmed
+}
+
+type BatchActionKind = 'probe' | 'promo' | 'remote' | 'refresh' | 'relogin'
+
+function getBatchActionLabel(kind: BatchActionKind) {
+  switch (kind) {
+    case 'probe':
+      return '本地状态检测'
+    case 'promo':
+      return 'Plus 优惠检测'
+    case 'remote':
+      return 'CLIProxyAPI 状态同步'
+    case 'refresh':
+      return 'Token 刷新'
+    case 'relogin':
+      return '二次登录'
+    default:
+      return kind
+  }
+}
+
+function shouldOfferChatgptRelogin(account: any) {
+  const authState = String(account?.chatgptLocal?.auth?.state || '').trim()
+  return Boolean(account?.password) && ['access_token_invalidated', 'unauthorized', 'missing_access_token'].includes(authState)
+}
+
+function appendActionLogsToText(text: string, logs: unknown) {
+  const normalizedLogs = Array.isArray(logs)
+    ? logs
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+    : []
+  if (normalizedLogs.length === 0) return text
+
+  const baseText = String(text || '').trim()
+  const suffix = `执行日志\n${normalizedLogs.join('\n')}`
+  return baseText ? `${baseText}\n\n${suffix}` : suffix
 }
 
 function SummaryField({
@@ -238,10 +296,12 @@ function DetailSection({ title, children }: { title: string; children: React.Rea
 }
 
 function LocalProbeSummary({ probe }: { probe: any }) {
-  const checkedAt = probe?.checked_at || probe?.auth?.checked_at || probe?.subscription?.checked_at || probe?.codex?.checked_at
+  const checkedAt = probe?.checked_at || probe?.promo?.checked_at || probe?.auth?.checked_at || probe?.subscription?.checked_at || probe?.codex?.checked_at
   const auth = probe?.auth || {}
   const subscription = probe?.subscription || {}
   const codex = probe?.codex || {}
+  const promo = probe?.promo || {}
+  const promoMeta = promoStateMeta(promo.state, promo.offer_title || 'Plus 优惠')
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -249,11 +309,17 @@ function LocalProbeSummary({ probe }: { probe: any }) {
         <Tag color={authStateMeta(auth.state).color}>认证: {authStateMeta(auth.state).label}</Tag>
         <Tag color={planMeta(subscription.plan).color}>订阅: {planMeta(subscription.plan).label}</Tag>
         <Tag color={codexStateMeta(codex.state).color}>Codex: {codexStateMeta(codex.state).label}</Tag>
+        <Tag color={promoMeta.color}>{promoMeta.label}</Tag>
       </div>
       <SummaryField label="探测时间" value={checkedAt ? formatSyncTime(checkedAt) : ''} />
       <SummaryField label="认证信息" value={auth.message} code />
       <SummaryField label="工作区套餐" value={subscription.workspace_plan_type} />
       <SummaryField label="Codex 信息" value={codex.message} code />
+      <SummaryField label="优惠地区" value={promo.country} />
+      <SummaryField label="优惠类型" value={promo.offer_title || promo.offer_kind} />
+      <SummaryField label="优惠活动" value={promo.campaign_id} />
+      <SummaryField label="优惠信息" value={promo.message} code />
+      <SummaryField label="优惠结账链接" value={promo.checkout_url} code />
     </div>
   )
 }
@@ -406,8 +472,9 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
         const data = r.data || {}
         const probe = typeof data === 'object' && data ? data.probe || null : null
         const cliproxySync = typeof data === 'object' && data ? data.sync || null : null
+        const text = appendActionLogsToText(r.error || data.message || '操作失败', data.logs)
         message.error({ content: `${actionLabel}失败`, key: toastKey })
-        showResult(actionLabel, 'error', r.error || data.message || '操作失败', '', probe, cliproxySync)
+        showResult(actionLabel, 'error', text, '', probe, cliproxySync)
         onRefresh()
         return
       }
@@ -430,7 +497,7 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
             : Object.keys(data).length > 0
               ? JSON.stringify(data, null, 2)
               : '操作成功'
-        showResult(actionLabel, 'success', text, '', probe, cliproxySync)
+        showResult(actionLabel, 'success', appendActionLogsToText(text, data.logs), '', probe, cliproxySync)
       }
       onRefresh()
     } catch (e: any) {
@@ -564,7 +631,8 @@ export default function Accounts() {
   const [registerLoading, setRegisterLoading] = useState(false)
   const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
   const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
-  const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
+  const [batchActionLoading, setBatchActionLoading] = useState('')
+  const [detailActionLoading, setDetailActionLoading] = useState<'relogin' | ''>('')
 
   useEffect(() => {
     if (platform) setCurrentPlatform(platform)
@@ -583,7 +651,7 @@ export default function Accounts() {
       message.warning('开始时间不能晚于结束时间')
       setAccounts([])
       setTotal(0)
-      return
+      return []
     }
 
     setLoading(true)
@@ -594,8 +662,10 @@ export default function Accounts() {
       if (createdAtStart) params.set('created_at_start', createdAtStart)
       if (createdAtEnd) params.set('created_at_end', createdAtEnd)
       const data = await apiFetch(`/accounts?${params}`)
-      setAccounts((data.items || []).map(normalizeAccount))
+      const normalizedItems = (data.items || []).map(normalizeAccount)
+      setAccounts(normalizedItems)
       setTotal(data.total)
+      return normalizedItems
     } finally {
       setLoading(false)
     }
@@ -845,6 +915,93 @@ export default function Accounts() {
     load()
   }
 
+  const handleDetailRelogin = async () => {
+    if (!currentAccount || currentPlatform !== 'chatgpt') return
+
+    const toastKey = `detail-relogin:${currentAccount.id}`
+    setDetailActionLoading('relogin')
+    message.loading({ content: '二次登录进行中...', key: toastKey, duration: 0 })
+
+    try {
+      const result = await apiFetch(`/actions/${currentPlatform}/${currentAccount.id}/relogin`, {
+        method: 'POST',
+        body: JSON.stringify({ params: {} }),
+      })
+
+      if (!result?.ok) {
+        message.error({ content: result?.error || '二次登录失败', key: toastKey })
+        const failureText = appendActionLogsToText(
+          String(result?.error || result?.data?.message || '二次登录失败'),
+          result?.data?.logs,
+        )
+        Modal.info({
+          title: '二次登录日志',
+          width: 760,
+          content: (
+            <pre
+              style={{
+                margin: 0,
+                maxHeight: 360,
+                overflow: 'auto',
+                padding: 12,
+                borderRadius: 8,
+                background: 'rgba(127,127,127,0.08)',
+                fontSize: 12,
+                lineHeight: 1.5,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+              }}
+            >
+              {failureText}
+            </pre>
+          ),
+        })
+        return
+      }
+
+      const refreshedItems = await load()
+      const refreshedAccount = Array.isArray(refreshedItems)
+        ? refreshedItems.find((item: any) => item.id === currentAccount.id) || null
+        : null
+      if (refreshedAccount) {
+        setCurrentAccount(refreshedAccount)
+      }
+
+      const authState = result?.data?.probe?.auth?.state || 'unknown'
+      message.success({ content: `二次登录完成，认证状态: ${authState}`, key: toastKey })
+      const successText = appendActionLogsToText(
+        String(result?.data?.message || `二次登录完成，认证状态: ${authState}`),
+        result?.data?.logs,
+      )
+      Modal.info({
+        title: '二次登录日志',
+        width: 760,
+        content: (
+          <pre
+            style={{
+              margin: 0,
+              maxHeight: 360,
+              overflow: 'auto',
+              padding: 12,
+              borderRadius: 8,
+              background: 'rgba(127,127,127,0.08)',
+              fontSize: 12,
+              lineHeight: 1.5,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+            }}
+          >
+            {successText}
+          </pre>
+        ),
+      })
+    } catch (e: any) {
+      message.error({ content: `二次登录失败: ${e.message}`, key: toastKey })
+    } finally {
+      setDetailActionLoading('')
+    }
+  }
+
   const showCpaSyncResult = (title: string, result: any) => {
     const lines = (result.items || [])
       .flatMap((item: any) =>
@@ -968,17 +1125,29 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchStatusSync = async (kind: 'probe' | 'remote', scope: 'selected' | 'all') => {
+  const handleBatchAction = async (
+    kind: BatchActionKind,
+    scope: 'selected' | 'all',
+  ) => {
     if (currentPlatform !== 'chatgpt') return
 
-    const loadingKey = `${kind}_${scope}` as typeof statusSyncLoading
-    const actionId = kind === 'probe' ? 'probe_local_status' : 'sync_cliproxyapi_status'
-    const actionLabel = kind === 'probe' ? '本地状态同步' : 'CLIProxyAPI 状态同步'
+    const loadingKey = `${kind}_${scope}`
+    const actionId =
+      kind === 'probe'
+        ? 'probe_local_status'
+        : kind === 'promo'
+        ? 'probe_promo_eligibility'
+        : kind === 'remote'
+        ? 'sync_cliproxyapi_status'
+        : kind === 'refresh'
+        ? 'refresh_token'
+        : 'relogin'
     const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
     const toastKey = `status-sync:${loadingKey}`
+    const actionLabel = getBatchActionLabel(kind)
 
     const body: Record<string, unknown> = {
-      params: {},
+      params: kind === 'promo' ? { country: 'ID' } : {},
     }
 
     if (scope === 'selected') {
@@ -997,7 +1166,7 @@ export default function Accounts() {
       if (filterStatus) body.status = filterStatus
     }
 
-    setStatusSyncLoading(loadingKey)
+    setBatchActionLoading(loadingKey)
     message.loading({ content: `${scopeLabel}${actionLabel}进行中...`, key: toastKey, duration: 0 })
     try {
       const result = await apiFetch(`/actions/${currentPlatform}/${actionId}/batch`, {
@@ -1020,7 +1189,7 @@ export default function Accounts() {
     } catch (e: any) {
       message.error({ content: `${actionLabel}失败: ${e.message}`, key: toastKey })
     } finally {
-      setStatusSyncLoading('')
+      setBatchActionLoading('')
     }
   }
 
@@ -1198,11 +1367,13 @@ export default function Accounts() {
           const auth = record.chatgptLocal?.auth || {}
           const subscription = record.chatgptLocal?.subscription || {}
           const codex = record.chatgptLocal?.codex || {}
+          const promo = record.chatgptLocal?.promo || {}
           const cpaSync = record.cpaSync || {}
           const sub2apiSync = record.sub2apiSync || {}
           const authMeta = authStateMeta(auth.state)
           const planTag = planMeta(subscription.plan)
           const codexMeta = codexStateMeta(codex.state)
+          const promoMeta = promoStateMeta(promo.state, promo.offer_title || 'Plus 优惠')
           const cpaMeta = uploadSyncMeta(cpaSync)
           const sub2apiMeta = uploadSyncMeta(sub2apiSync)
 
@@ -1212,6 +1383,7 @@ export default function Accounts() {
                 <Tag color={authMeta.color}>{authMeta.label}</Tag>
                 <Tag color={planTag.color}>{planTag.label}</Tag>
                 <Tag color={codexMeta.color}>Codex {codexMeta.label}</Tag>
+                {promo.state ? <Tag color={promoMeta.color}>{promoMeta.label}</Tag> : null}
               </div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                 <Tag color={cpaMeta.color} title={uploadSyncTitle('CPA', cpaSync)}>
@@ -1327,13 +1499,21 @@ export default function Accounts() {
     },
   )
 
-  const statusSyncMenuItems: MenuProps['items'] = [
+  const batchActionMenuItems: MenuProps['items'] = [
     {
       key: `probe:${getStatusSyncScope()}`,
       label:
         getStatusSyncScope() === 'selected'
-          ? `同步所选本地状态 (${selectedRowKeys.length})`
-          : `同步当前筛选本地状态 (${total})`,
+          ? `检测所选本地状态 (${selectedRowKeys.length})`
+          : `检测当前筛选本地状态 (${total})`,
+      disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
+    },
+    {
+      key: `promo:${getStatusSyncScope()}`,
+      label:
+        getStatusSyncScope() === 'selected'
+          ? `检测所选 Plus 优惠 (${selectedRowKeys.length})`
+          : `检测当前筛选 Plus 优惠 (${total})`,
       disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
     },
     {
@@ -1342,6 +1522,22 @@ export default function Accounts() {
         getStatusSyncScope() === 'selected'
           ? `同步所选 CLIProxyAPI 状态 (${selectedRowKeys.length})`
           : `同步当前筛选 CLIProxyAPI 状态 (${total})`,
+      disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
+    },
+    {
+      key: `refresh:${getStatusSyncScope()}`,
+      label:
+        getStatusSyncScope() === 'selected'
+          ? `刷新所选 Token (${selectedRowKeys.length})`
+          : `刷新当前筛选 Token (${total})`,
+      disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
+    },
+    {
+      key: `relogin:${getStatusSyncScope()}`,
+      label:
+        getStatusSyncScope() === 'selected'
+          ? `二次登录所选账号 (${selectedRowKeys.length})`
+          : `二次登录当前筛选账号 (${total})`,
       disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
     },
   ]
@@ -1391,19 +1587,19 @@ export default function Accounts() {
             <Dropdown
               trigger={['click']}
               menu={{
-                items: statusSyncMenuItems,
+                items: batchActionMenuItems,
                 onClick: ({ key }) => {
-                  const [kind, scope] = String(key).split(':') as ['probe' | 'remote', 'selected' | 'all']
-                  handleBatchStatusSync(kind, scope)
+                  const [kind, scope] = String(key).split(':') as [BatchActionKind, 'selected' | 'all']
+                  handleBatchAction(kind, scope)
                 },
               }}
             >
               <Button
                 icon={<SyncOutlined />}
-                loading={statusSyncLoading !== ''}
+                loading={batchActionLoading !== ''}
                 disabled={total === 0}
               >
-                状态同步
+                批量操作
               </Button>
             </Dropdown>
           )}
@@ -1643,10 +1839,29 @@ export default function Accounts() {
             ) : null}
             {currentPlatform === 'chatgpt' ? (
               <DetailSection title="本地真实状态">
+                {shouldOfferChatgptRelogin(currentAccount) ? (
+                  <Alert
+                    style={{ marginBottom: 12 }}
+                    type="warning"
+                    showIcon
+                    message="检测到当前 Access Token 已失效"
+                    description="可以直接尝试一次二次登录，重新获取新的 Token，并刷新本地探测结果。"
+                    action={
+                      <Button
+                        size="small"
+                        type="primary"
+                        loading={detailActionLoading === 'relogin'}
+                        onClick={handleDetailRelogin}
+                      >
+                        二次登录
+                      </Button>
+                    }
+                  />
+                ) : null}
                 {currentAccount.chatgptLocal && Object.keys(currentAccount.chatgptLocal).length > 0 ? (
                   <LocalProbeSummary probe={currentAccount.chatgptLocal} />
                 ) : (
-                  <Text type="secondary">尚未探测。可在操作菜单中点击“探测本地状态”。</Text>
+                  <Text type="secondary">尚未探测。可在操作菜单中点击“探测本地状态”或“检测 Plus 优惠资格”。</Text>
                 )}
               </DetailSection>
             ) : null}

@@ -69,9 +69,13 @@ def _apply_action_result(
         status_reason = ""
         if action_id == "probe_local_status":
             status_reason = apply_chatgpt_status_policy(acc_model, local_probe=data.get("probe"))
+        elif action_id == "probe_promo_eligibility":
+            status_reason = apply_chatgpt_status_policy(acc_model, local_probe=data.get("probe"))
+        elif action_id == "relogin":
+            status_reason = apply_chatgpt_status_policy(acc_model, local_probe=data.get("probe"))
         elif action_id == "sync_cliproxyapi_status":
             status_reason = apply_chatgpt_status_policy(acc_model, remote_sync=data.get("sync"))
-        if status_reason:
+        if status_reason or action_id == "relogin":
             from datetime import datetime, timezone
 
             acc_model.updated_at = datetime.now(timezone.utc)
@@ -107,10 +111,27 @@ def _apply_action_result(
         )
     if result.get("ok") and result.get("data", {}) and isinstance(result["data"], dict):
         data = result["data"]
-        tracked_keys = {"access_token", "accessToken", "refreshToken", "clientId", "clientSecret", "webAccessToken"}
+        tracked_keys = {
+            "access_token",
+            "refresh_token",
+            "session_token",
+            "id_token",
+            "workspace_id",
+            "chatgpt_token_source",
+            "accessToken",
+            "refreshToken",
+            "clientId",
+            "clientSecret",
+            "clientIdHash",
+            "clientSecretExpiresAt",
+            "webAccessToken",
+            "expiresAt",
+        }
         if tracked_keys.intersection(data.keys()):
             extra = acc_model.get_extra()
-            extra.update(data)
+            for key in tracked_keys:
+                if key in data:
+                    extra[key] = data[key]
             acc_model.set_extra(extra)
             if data.get("access_token"):
                 acc_model.token = data["access_token"]
